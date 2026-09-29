@@ -2,8 +2,7 @@
 //
 // Bilingual (Urdu & Arabic) OCR Scanner - Flutter UI.
 //
-// Flow:  Scan (Google ML Kit document scanner: edges, perspective, shadow
-//        clean-up) or Camera / Gallery  ->  upload the WHOLE page (no manual cropping;
+// Flow:  Camera / Gallery  ->  upload the WHOLE page (no manual cropping;
 //        the backend finds every text box itself)  ->  text streams in, in
 //        reading order  ->  page is shown with its original structure
 //        (title, paragraphs, bullets, tables).
@@ -14,7 +13,6 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'api_service.dart';
@@ -87,52 +85,6 @@ class _ScannerPageState extends State<ScannerPage> {
     final LostDataResponse lost = await _picker.retrieveLostData();
     if (lost.isEmpty || lost.file == null || !mounted) return;
     _startScan(File(lost.file!.path));
-  }
-
-  /// Best capture path: Google's ML Kit document scanner (Android only).
-  ///
-  /// It finds the page edges, flattens the perspective, removes shadows and
-  /// stains, and hands back a clean page image - exactly what the OCR needs.
-  /// Falls back to the plain camera when it is unavailable (iOS, or Google
-  /// Play services missing / outdated).
-  ///
-  /// Both entry points go through it:
-  ///  * camera  - the scanner opens its camera (auto-capture on the page);
-  ///  * gallery - the scanner opens with its gallery button enabled. ML Kit
-  ///    cannot be handed an existing file, so the photo is picked INSIDE the
-  ///    scanner (gallery icon), which then detects the page, flattens and
-  ///    cleans it exactly like a camera capture.
-  Future<void> _capture(ImageSource source) async {
-    final fromGallery = source == ImageSource.gallery;
-    if (!Platform.isAndroid) {
-      _snack('Document scanner is only available on Android - using the plain '
-          '${fromGallery ? 'gallery' : 'camera'}.');
-      return _pick(source);
-    }
-    if (fromGallery) {
-      _snack('Tap the gallery icon in the scanner to choose your photo.');
-    }
-    final scanner = DocumentScanner(
-      options: DocumentScannerOptions(
-        documentFormats: const {DocumentFormat.jpeg},
-        mode: ScannerMode.full, // crop + filters + shadow/stain clean-up
-        pageLimit: 1,
-        isGalleryImport: fromGallery,
-      ),
-    );
-    try {
-      final DocumentScanningResult result = await scanner.scanDocument();
-      final images = result.images;
-      if (images == null || images.isEmpty) return;
-      _startScan(File(images.first));
-    } on PlatformException catch (e) {
-      if ((e.message ?? '').toLowerCase().contains('cancel')) return; // user backed out
-      _snack('Document scanner unavailable (${e.message}) - using the plain '
-          '${fromGallery ? 'gallery' : 'camera'}.');
-      await _pick(source);
-    } finally {
-      await scanner.close();
-    }
   }
 
   Future<void> _pick(ImageSource source) async {
@@ -296,30 +248,23 @@ class _ScannerPageState extends State<ScannerPage> {
             Icon(Icons.menu_book, size: 96, color: Theme.of(context).colorScheme.primary),
             const SizedBox(height: 16),
             Text(
-              'Scan a full book page.\nThe app finds and reads all the text by itself.',
+              'Photograph a full book page.\nThe app finds and reads all the text by itself.',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 32),
             FilledButton.icon(
-              onPressed: () => _capture(ImageSource.camera),
+              onPressed: () => _pick(ImageSource.camera),
               icon: const Icon(Icons.photo_camera),
               label: const Text('Take photo'),
-              style: FilledButton.styleFrom(minimumSize: const Size(240, 56)),
+              style: FilledButton.styleFrom(minimumSize: const Size(220, 52)),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: () => _capture(ImageSource.gallery),
+              onPressed: () => _pick(ImageSource.gallery),
               icon: const Icon(Icons.photo_library),
               label: const Text('Choose from gallery'),
-              style: OutlinedButton.styleFrom(minimumSize: const Size(240, 56)),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'Both go through the document scanner (page edges, straightening, '
-              'shadow removal) before the text is read.',
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodySmall,
+              style: OutlinedButton.styleFrom(minimumSize: const Size(220, 52)),
             ),
           ],
         ),
