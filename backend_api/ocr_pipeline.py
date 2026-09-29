@@ -344,6 +344,7 @@ class TextDetector:
             return self._drop_vertical_strips(self._fallback(binary, []))
         boxes = self._drop_vertical_strips(boxes)
         boxes = self._merge_stacked(self._split_tall(gray, binary, boxes))
+        boxes = self._resolve_containment(boxes)
         # The OpenCV fallback can pick up page borders too: filter again.
         return self._drop_vertical_strips(self._fallback(binary, boxes))
 
@@ -380,6 +381,57 @@ class TextDetector:
         return result
 
     @staticmethod
+    def _resolve_containment(boxes: List[ip.Box]) -> List[ip.Box]:
+        """Fix boxes that swallow a neighbouring line.
+
+        With dense harakat / waqf marks (e.g. Quranic text) the detector may
+        return one box covering two lines AND a separate box for one of
+        those lines. The big box is then replaced by the part of it that no
+        other box covers (the missing line); leftovers shorter than half a
+        line are dropped. This removes duplicate lines and recovers lost ones.
+        """
+        if len(boxes) < 2:
+            return boxes
+        median_h = float(np.median([b[3] - b[1] for b in boxes]))
+        result = []
+        for i, outer in enumerate(boxes):
+            oh = outer[3] - outer[1]
+            inner = [b for j, b in enumerate(boxes) if j != i
+                     and ip.boxes_overlap_ratio(outer, b) > 0.8
+                     and (b[3] - b[1]) * (b[2] - b[0]) < (outer[3] - outer[1]) * (outer[2] - outer[0])
+                     and oh > 1.3 * (b[3] - b[1])]
+            if not inner:
+                result.append(outer)
+                continue
+            # vertical spans of `outer` not covered by any inner box
+            covered = np.zeros(oh, dtype=bool)
+            for b in inner:
+                covered[max(0, b[1] - outer[1]):max(0, b[3] - outer[1])] = True
+            y = 0
+            while y < oh:
+                if covered[y]:
+                    y += 1
+                    continue
+                start = y
+                while y < oh and not covered[y]:
+                    y += 1
+                piece = (outer[0], outer[1] + start, outer[2], outer[1] + y)
+                piece_area = float((piece[2] - piece[0]) * (piece[3] - piece[1]))
+
+                def covered_by(b: ip.Box) -> float:
+                    """Share of the piece's OWN area that box b covers."""
+                    ix = max(0, min(piece[2], b[2]) - max(piece[0], b[0]))
+                    iy = max(0, min(piece[3], b[3]) - max(piece[1], b[1]))
+                    return ix * iy / piece_area
+
+                duplicate = any(covered_by(b) > 0.5 for j, b in enumerate(boxes) if j != i)
+                if y - start >= 0.5 * median_h and not duplicate:
+                    result.append(piece)
+        if len(result) != len(boxes):
+            logger.info("containment: %d boxes -> %d", len(boxes), len(result))
+        return result
+
+    @staticmethod
     def _drop_vertical_strips(boxes: List[ip.Box]) -> List[ip.Box]:
         """Remove tall, narrow boxes: decorative page borders and the book's
         fold, which the detector often reports as text. Urdu/Arabic lines run
@@ -387,7 +439,8 @@ class TextDetector:
         line height cannot be text."""
         median_h = float(np.median([b[3] - b[1] for b in boxes]))
         kept = [b for b in boxes
-                if not (b[3] - b[1] > 2.5 * median_h and b[2] - b[0] < 0.8 * median_h)]
+                if not (b[3] - b[1] > 2.5 * median_h and b[2] - b[0] < 0.8 * median_h)
+                and not (b[3] - b[1] > 4 * median_h and b[2] - b[0] < 0.2 * (b[3] - b[1]))]
         if len(kept) < len(boxes):
             logger.info("dropped %d border/ornament strips", len(boxes) - len(kept))
         return kept or boxes
@@ -696,7 +749,88 @@ def _align_table_rows(block: Block, line_h: float) -> None:
     block.box = ip.union_box([r.box for r in block.rows])
 
 
-def build_layout(boxes: List[ip.Box]) -> List[Block]:
+def select_main_page(boxes: List[ip.Box], rules: List[int],
+                     image_size: Tuple[int, int]) -> List[ip.Box]:
+    """Keep only text that belongs to the photographed page.
+
+    * Boxes touching the image edge are cut off by the camera frame (the
+      facing page, the table cloth) and cannot be read completely: dropped.
+    * If a long vertical printed line (page frame / the book's fold) separates
+      the main text from a small amount of text beyond it, that text is the
+      facing page: dropped. A rule is only used this way when the text beyond
+      it is less than a quarter of all text, so a two-column page (whose
+      columns are also separated by a rule) is never cut in half.
+    """
+    w, h = image_size
+    edge = 3
+    kept = [b for b in boxes if b[0] > edge and b[1] > edge and b[2] < w - edge and b[3] < h - edge]
+    if not kept:
+        return boxes
+    area = np.array([(b[2] - b[0]) * (b[3] - b[1]) for b in kept], dtype=np.float64)
+    cx = np.array([(b[0] + b[2]) / 2 for b in kept])
+    order = np.argsort(cx)
+    centre = cx[order][np.searchsorted(np.cumsum(area[order]), area.sum() / 2)]  # area-weighted median
+    total = area.sum()
+    right = [r for r in rules if r > centre]
+    left = [r for r in rules if r < centre]
+    keep = np.ones(len(kept), dtype=bool)
+    # Only boxes lying ENTIRELY beyond a rule are dropped: a side header that
+    # straddles the page frame still belongs to the page.
+    bx1 = np.array([b[0] for b in kept], dtype=np.float64)
+    bx2 = np.array([b[2] for b in kept], dtype=np.float64)
+    if right and area[bx1 > min(right)].sum() < 0.25 * total:
+        keep &= ~(bx1 > min(right))
+    if left and area[bx2 < max(left)].sum() < 0.25 * total:
+        keep &= ~(bx2 < max(left))
+
+    # Text margins: the main page's lines end on common right / left margins
+    # (Urdu/Arabic is justified). A box that STARTS beyond the right margin
+    # or ENDS before the left margin is the facing page - this also works
+    # when a curled page hides the frame line.
+    def weighted_percentile(values: np.ndarray, q: float) -> float:
+        idx = np.argsort(values)
+        cum = np.cumsum(area[idx]) / total
+        return float(values[idx][min(len(idx) - 1, np.searchsorted(cum, q))])
+
+    median_h = float(np.median([b[3] - b[1] for b in kept]))
+    x1 = np.array([b[0] for b in kept], dtype=np.float64)
+    x2 = np.array([b[2] for b in kept], dtype=np.float64)
+    right_margin = weighted_percentile(x2, 0.9) + 0.3 * median_h
+    left_margin = weighted_percentile(x1, 0.1) - 0.3 * median_h
+    width = np.maximum(x2 - x1, 1.0)
+    # more than half of the box lies outside the margin
+    beyond_right = np.clip(x2 - np.maximum(x1, right_margin), 0, None) / width > 0.5
+    before_left = np.clip(np.minimum(x2, left_margin) - x1, 0, None) / width > 0.5
+    if area[beyond_right].sum() < 0.25 * total:
+        keep &= ~beyond_right
+    if area[before_left].sum() < 0.25 * total:
+        keep &= ~before_left
+    dropped = len(boxes) - int(keep.sum())
+    if dropped:
+        logger.info("main page: dropped %d boxes outside the page / at the photo edge", dropped)
+    return [b for b, k in zip(kept, keep) if k]
+
+
+def sort_reading_order(blocks: List[Block]) -> List[Block]:
+    """Put everything in the reading order of the printed page.
+
+    * inside a row: cells right-to-left (descending X), as Urdu/Arabic are read
+    * inside a block: rows top-to-bottom by their vertical centre (median of
+      the cells' centres, robust to one tall box with harakat)
+    * blocks: top-to-bottom by their first row
+    """
+    def row_y(row: Row) -> float:
+        return float(np.median([(c.box[1] + c.box[3]) / 2 for c in row.cells])) if row.cells else row.box[1]
+
+    for block in blocks:
+        for row in block.rows:
+            row.cells.sort(key=lambda c: c.box[2], reverse=True)
+        block.rows.sort(key=row_y)
+    blocks.sort(key=lambda b: row_y(b.rows[0]) if b.rows else b.box[1])
+    return blocks
+
+
+def build_layout(boxes: List[ip.Box], separators: Sequence[int] = ()) -> List[Block]:
     """Re-create the page structure from the auto-cropped boxes.
 
     * rows   : boxes on the same line, ordered right-to-left
@@ -717,7 +851,7 @@ def build_layout(boxes: List[ip.Box]) -> List[Block]:
     def is_heading(row: Row) -> bool:
         """A single short box centred on the page (e.g. a chapter heading)."""
         b = row.box
-        return len(row.cells) == 1 and (b[2] - b[0]) < 0.8 * page_w and \
+        return len(row.cells) == 1 and (b[2] - b[0]) < 0.5 * page_w and \
             abs((b[0] + b[2]) / 2 - page_cx) < 0.1 * page_w
 
     # Consecutive rows closer than ~0.8 line heights form one block; a
@@ -729,7 +863,11 @@ def build_layout(boxes: List[ip.Box]) -> List[Block]:
             gap = row.box[1] - prev.rows[-1].box[3]
             h_overlap = min(prev.box[2], row.box[2]) - max(prev.box[0], row.box[0])
             separate = is_heading(row) != is_heading(prev.rows[-1])
-            if gap < 0.8 * line_h and h_overlap > 0 and not separate:
+            # A printed horizontal rule between the two rows ends the block.
+            prev_cy = (prev.rows[-1].box[1] + prev.rows[-1].box[3]) / 2
+            row_cy = (row.box[1] + row.box[3]) / 2
+            ruled = any(prev_cy < y < row_cy for y in separators)
+            if gap < 0.8 * line_h and h_overlap > 0 and not separate and not ruled:
                 prev.rows.append(row)
                 prev.box = ip.union_box([prev.box, row.box])
                 continue
@@ -745,7 +883,7 @@ def build_layout(boxes: List[ip.Box]) -> List[Block]:
                 is_heading(block.rows[0]) or
                 (i == 0 and block.box[3] - block.box[1] > 1.2 * line_h)):
             block.type = "Title"                   # centred or large lone line
-    return blocks
+    return sort_reading_order(blocks)
 
 
 def apply_layout_hints(blocks: List[Block], hints: List[Tuple[ip.Box, str]]) -> None:
@@ -906,16 +1044,16 @@ class OcrPipeline:
         # the detected text boxes. Only an upside-down page is processed twice.
         turns, flipped_turns = self._orientation_candidates(image_bgr)
         pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
-        boxes = self.detector.detect(pre.gray, pre.binary)
+        boxes = self._page_boxes(pre)
         if self._is_upside_down(pre, boxes):
             turns = flipped_turns
             pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
-            boxes = self.detector.detect(pre.gray, pre.binary)
+            boxes = self._page_boxes(pre)
 
         # LayoutParser only supplies block-type hints, so it runs in the
         # background and is applied at the end - it never delays the text.
         fut_hints = self._layout_executor.submit(self.layout.detect, pre.color)
-        blocks = build_layout(boxes)
+        blocks = build_layout(boxes, pre.horizontal_rules)
         result = PipelineResult(pre=pre, blocks=blocks, layout_engine=self.layout.engine,
                                 processing_ms=0, rotation=turns * 90)
         logger.info("layout: %d boxes, %d blocks in %d ms (rotated %d deg)", len(boxes),
@@ -948,6 +1086,12 @@ class OcrPipeline:
         yield "done", result
 
     # ------------------------------------------------------------ helpers
+    def _page_boxes(self, pre: ip.PreprocessResult) -> List[ip.Box]:
+        """Auto-cropped text boxes of the main page only."""
+        boxes = self.detector.detect(pre.gray, pre.binary)
+        h, w = pre.gray.shape[:2]
+        return select_main_page(boxes, pre.vertical_rules, (w, h))
+
     def _crop(self, pre: ip.PreprocessResult, box: ip.Box) -> np.ndarray:
         """Grayscale crop with a little vertical margin (harakat that stick
         out of the tight detector box) and a white border."""
@@ -990,7 +1134,33 @@ class OcrPipeline:
                 if listy >= max(1, len(kept_rows) // 2):
                     block.type = "List"
             kept_blocks.append(block)
-        result.blocks = kept_blocks
+        result.blocks = sort_reading_order(self._split_on_language(kept_blocks))
+
+    @staticmethod
+    def _split_on_language(blocks: List[Block]) -> List[Block]:
+        """Start a new block where the running text switches between Arabic
+        and Urdu (e.g. an Arabic verse followed by its Urdu translation), so
+        the formatted text keeps them as separate paragraphs. Tables are
+        left alone (a table row mixes both languages by design)."""
+        out: List[Block] = []
+        for block in blocks:
+            if block.type == "Table" or len(block.rows) < 2:
+                out.append(block)
+                continue
+            current: List[Row] = []
+            current_lang = None
+            for row in block.rows:
+                langs = [c.language for c in row.cells if c.text]
+                lang = max(set(langs), key=langs.count) if langs else None
+                if current and lang and current_lang and lang != current_lang:
+                    out.append(Block(box=ip.union_box([r.box for r in current]),
+                                     type=block.type, rows=current))
+                    current = []
+                current.append(row)
+                current_lang = lang or current_lang
+            out.append(Block(box=ip.union_box([r.box for r in current]),
+                             type=block.type, rows=current, columns=block.columns))
+        return out
 
     @staticmethod
     def _orientation_candidates(image_bgr: np.ndarray) -> Tuple[int, int]:

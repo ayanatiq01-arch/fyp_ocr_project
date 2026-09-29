@@ -94,6 +94,15 @@ class BlockOut(BaseModel):
     rows: List[RowOut]
 
 
+class ReadingLine(BaseModel):
+    """One printed line, in the reading order of the page."""
+    block: int = Field(..., description="Index into blocks")
+    type: str = Field(..., description="Type of the block the line belongs to")
+    bbox: List[int]
+    language: str = Field(..., description="urdu | arabic | mixed | unknown")
+    text: str = Field(..., description="Cells right-to-left; TAB between table columns")
+
+
 class ImageInfo(BaseModel):
     width: int
     height: int
@@ -107,6 +116,10 @@ class OcrResponse(BaseModel):
     skew_angle: float = Field(..., description="Degrees the page was rotated to deskew it")
     layout_engine: str
     blocks: List[BlockOut]
+    reading_order: List[ReadingLine] = Field(
+        default_factory=list,
+        description="Every line of the page top-to-bottom (Y), each line's words "
+                    "right-to-left (X): the exact reading order of the original layout")
     formatted_text: str = Field(..., description="Page text: blank line between blocks, "
                                                  "TAB between table columns, '• ' bullets")
     processing_ms: int
@@ -133,12 +146,20 @@ def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
     """Convert pipeline output to the API schema, mapping every box back to
     the coordinate system of the image the client uploaded."""
     pre = result.pre
-    blocks_out = []
+    blocks_out, reading = [], []
+    # result.blocks is already in reading order (ocr_pipeline.sort_reading_order).
     for idx, block in enumerate(result.blocks):
-        rows = [RowOut(bbox=list(pre.to_original(row.box)), is_bullet=row.is_bullet,
-                       text=row.text(table=block.type == "Table", columns=block.columns),
-                       cells=[cell_out(pre, c) for c in row.cells])
-                for row in block.rows]
+        rows = []
+        for row in block.rows:
+            text = row.text(table=block.type == "Table", columns=block.columns)
+            bbox = list(pre.to_original(row.box))
+            rows.append(RowOut(bbox=bbox, is_bullet=row.is_bullet, text=text,
+                               cells=[cell_out(pre, c) for c in row.cells]))
+            langs = {c.language for c in row.cells if c.text}
+            reading.append(ReadingLine(
+                block=idx, type=block.type, bbox=bbox,
+                language=langs.pop() if len(langs) == 1 else ("mixed" if langs else "unknown"),
+                text=f"• {text}" if row.is_bullet and text else text))
         blocks_out.append(BlockOut(
             id=idx, type=block.type, bbox=list(pre.to_original(block.box)),
             columns=block.columns, language=block.language, text=block.text(), rows=rows))
@@ -150,6 +171,7 @@ def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
         skew_angle=pre.skew_angle,
         layout_engine=result.layout_engine,
         blocks=blocks_out,
+        reading_order=reading,
         formatted_text=result.formatted_text(),
         processing_ms=result.processing_ms,
     )

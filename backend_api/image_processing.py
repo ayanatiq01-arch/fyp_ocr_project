@@ -273,6 +273,10 @@ class PreprocessResult:
     original_size: Tuple[int, int]  # (width, height) of the uploaded image
     # 2x3 affine: uploaded-image coords -> processed-image coords
     matrix: np.ndarray = field(repr=False, default_factory=lambda: np.eye(2, 3))
+    # x positions of long vertical printed lines (page frame, fold)
+    vertical_rules: List[int] = field(default_factory=list)
+    # y positions of long horizontal printed lines (section separators)
+    horizontal_rules: List[int] = field(default_factory=list)
 
     def to_original(self, box: Box) -> Box:
         """Map a box on the processed image back to the uploaded image.
@@ -366,7 +370,49 @@ def text_runs_vertically(binary: np.ndarray) -> bool:
     return vertical > horizontal
 
 
+def find_vertical_rules(binary: np.ndarray, min_fraction: float = 0.35) -> List[int]:
+    """x positions of long vertical printed lines (page frames, column rules,
+    the book's fold).
+
+    They are used to tell the main page apart from text of the facing page
+    that is visible at the edge of the photo. Must run before
+    :func:`remove_line_artifacts`, which deletes these lines.
+    """
+    h, w = binary.shape[:2]
+    ink = (binary == 0).astype(np.uint8) * 255
+    # Keep only long vertical runs of ink.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, h // 12)))
+    vertical = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(vertical, connectivity=8)
+    max_thickness = max(8, w // 60)
+    rules = []
+    for i in range(1, count):
+        x, _, cw, ch = stats[i, :4]
+        if ch >= min_fraction * h and cw <= max_thickness:
+            rules.append(int(x + cw // 2))
+    return sorted(rules)
+
+
+def find_horizontal_rules(binary: np.ndarray, min_fraction: float = 0.2) -> List[int]:
+    """y positions of long horizontal printed lines (e.g. the rule between a
+    translation and its footnotes). Used as block boundaries; must run before
+    :func:`remove_line_artifacts`, which deletes these lines."""
+    h, w = binary.shape[:2]
+    ink = (binary == 0).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w // 12), 1))
+    horizontal = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(horizontal, connectivity=8)
+    max_thickness = max(8, h // 60)
+    rules = []
+    for i in range(1, count):
+        _, y, cw, ch = stats[i, :4]
+        if cw >= min_fraction * w and ch <= max_thickness:
+            rules.append(int(y + ch // 2))
+    return sorted(rules)
+
+
 def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
+               min_side: int = 1600,
                denoise_strength: float = 7.0,
                max_skew: float = 15.0,
                quarter_turns: int = 0) -> PreprocessResult:
@@ -374,24 +420,29 @@ def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
 
     Steps:
         0. Undo a 90/180/270 degree page rotation (``quarter_turns`` CCW,
-           decided by the caller - see OcrPipeline._detect_orientation).
-        1. Down-scale very large photos (keeps latency predictable).
+           decided by the caller - see OcrPipeline).
+        1. Resize: down-scale very large photos (keeps latency predictable)
+           and up-scale small ones (e.g. photos compressed by a messaging
+           app) so the long side is between ``min_side`` and ``max_side``.
         2. Grayscale + non-local-means denoising.
         3. Shadow / illumination normalisation.
         4. Adaptive binarisation -> skew estimation.
         5. Rotate colour + grayscale images by the estimated angle.
-        6. Re-binarise the straightened image and remove specks.
+        6. Re-binarise the straightened image, note page-frame lines, remove
+           specks and lines.
     """
     orig_h, orig_w = image_bgr.shape[:2]
 
     # 0. Quarter-turn rotation (recorded in the affine matrix).
     image_bgr, turn_m = rotate90(image_bgr, quarter_turns)
 
-    # 1. Down-scale (recorded in the affine matrix).
-    scale = min(1.0, max_side / float(max(orig_h, orig_w)))
-    if scale < 1.0:
+    # 1. Resize (recorded in the affine matrix).
+    long_side = float(max(orig_h, orig_w))
+    scale = max_side / long_side if long_side > max_side else \
+        (min_side / long_side if long_side < min_side else 1.0)
+    if scale != 1.0:
         image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale,
-                               interpolation=cv2.INTER_AREA)
+                               interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
     scale_m = np.array([[scale, 0, 0], [0, scale, 0]], dtype=np.float64)
 
     # 2-3. Clean grayscale.
@@ -415,6 +466,8 @@ def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
     binary = cv2.medianBlur(binary, 3)
     min_area = max(3, int(gray.shape[0] * gray.shape[1] / 1_500_000))
     binary = remove_small_specks(binary, min_area)
+    rules = find_vertical_rules(binary)
+    h_rules = find_horizontal_rules(binary)
     binary = remove_line_artifacts(binary)
 
     # Compose quarter-turn, then scale, then deskew: p' = R * (S * (T * p))
@@ -424,7 +477,8 @@ def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
                  gray.shape[::-1])
     return PreprocessResult(color=color, gray=gray, binary=binary,
                             skew_angle=angle, original_size=(orig_w, orig_h),
-                            matrix=full[:2])
+                            matrix=full[:2], vertical_rules=rules,
+                            horizontal_rules=h_rules)
 
 
 # --------------------------------------------------------------------------- #
