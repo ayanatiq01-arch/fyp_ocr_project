@@ -1188,4 +1188,7 @@ class OcrPipeline:
         up = float(np.mean([r.confidence for r in upright]))
         down = float(np.mean([r.confidence for r in flipped]))
         logger.info("orientation check on %d boxes: upright=%.3f flipped=%.3f", len(crops), up, down)
-        return down > up + 0.05
+        # Upside-down photos are rare and give a clear gap (about 0.5 vs 0.3);
+        # small, blurry photos give low scores both ways, so demand a clear
+        # margin before turning the page over.
+        return down > up + 0.12
