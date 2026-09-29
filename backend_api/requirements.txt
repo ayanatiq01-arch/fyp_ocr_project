@@ -10,10 +10,17 @@ uvicorn[standard]==0.54.0
 python-multipart==0.0.32          # multipart/form-data uploads
 pydantic==2.13.5
 
-# --- Arabic OCR (PaddleOCR 3.x) ---
+# --- Text detection (PaddleOCR 3.x DB detector; Arabic RECOGNITION is Kraken) ---
 paddlepaddle==3.3.1
 paddleocr==3.7.0
 paddlex==3.7.2
+
+# --- Arabic OCR (Kraken) ---
+# NOT listed here on purpose: kraken 7.1.1 pins click<8.3 while PaddleX's
+# huggingface-hub asks for click>=8.4.2, so pip cannot resolve both in one run.
+# setup_backend.bat installs `kraken==7.1.1` in a second step (click is only
+# used by command-line tools; OCR is unaffected - verified). Model file:
+# kraken_models/arabic_best.mlmodel (downloaded by setup_backend.bat).
 
 # --- Layout analysis ---
 layoutparser==0.3.4

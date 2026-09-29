@@ -385,7 +385,7 @@ class _ScannerPageState extends State<ScannerPage> {
                     style: TextStyle(fontWeight: FontWeight.bold)),
               ),
               engine('UTRNet (Urdu)', 'urdu'),
-              engine('PaddleOCR (Arabic)', 'arabic'),
+              engine('Kraken (Arabic)', 'arabic'),
               const SizedBox(height: 8),
             ],
           ),
