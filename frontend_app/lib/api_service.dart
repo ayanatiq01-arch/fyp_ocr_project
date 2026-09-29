@@ -94,7 +94,7 @@ class OcrCell {
   /// "urdu" | "arabic" | "unknown"
   final String language;
 
-  /// "UTRNet" | "Kraken" | "" (empty = not read yet)
+  /// "UTRNet" | "PaddleOCR" | "" (empty = not read yet)
   final String engine;
 
   /// 0-100, confidence of the accepted engine.

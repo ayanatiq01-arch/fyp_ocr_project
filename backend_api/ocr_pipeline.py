@@ -19,7 +19,7 @@ Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline with a
         ▼
     for every box, in reading order:
         ├──► UTRNetRecognizer        (Urdu)    ─┐  run at the same time
-        └──► KrakenArabicRecognizer  (Arabic)  ─┘
+        └──► PaddleArabicRecognizer  (Arabic)  ─┘
                         │
                         ▼
                 route_by_confidence()     higher confidence wins, other discarded
@@ -30,18 +30,17 @@ Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline with a
 
 Why confidences are comparable
 ------------------------------
-Both recognisers are CTC models. Kraken reports a confidence per output
-character; its line score is their mean. :class:`UTRNetRecognizer` computes
-its score the same way (mean max-softmax probability of the characters kept
-by CTC decoding), so the two numbers are on the same 0-1 scale.
+Both recognisers are CTC models. PaddleOCR's ``rec_score`` is the mean of the
+max softmax probability over the frames that survive CTC decoding (non-blank,
+not a repeat). :class:`UTRNetRecognizer` computes its score **the same way**,
+so the two numbers are on the same 0-1 scale and can be compared directly.
 
 Models (all published, downloaded as-is):
 * UTRNet-Large  - ``UTRNet-High-Resolution-Urdu-Text-Recognition/saved_models/
   UTRNet-Large/best_norm_ED.pth`` (from the UTRNet README, Google Drive link).
-* Kraken        - ``kraken_models/arabic_best.mlmodel``, "Printed Arabic Base
-  Model Trained on the OpenITI Corpus" (DOI 10.5281/zenodo.7050296, CC0).
-* PaddleOCR     - ``PP-OCRv5_mobile_det`` (text DETECTION only), auto-downloaded
-  to ``~/.paddlex/official_models`` on first run.
+* PaddleOCR     - ``arabic_PP-OCRv5_mobile_rec`` (recognition) and
+  ``PP-OCRv5_mobile_det`` (text detection), auto-downloaded to
+  ``~/.paddlex/official_models`` on first run.
 * LayoutParser  - ``lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config``.
 """
 
@@ -53,7 +52,6 @@ import re
 import sys
 import threading
 import time
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,8 +75,7 @@ UTRNET_WEIGHTS = Path(os.getenv(
     "UTRNET_WEIGHTS", UTRNET_DIR / "saved_models" / "UTRNet-Large" / "best_norm_ED.pth"))
 UTRNET_GLYPHS = UTRNET_DIR / "UrduGlyphs.txt"
 
-KRAKEN_ARABIC_MODEL = Path(os.getenv(
-    "KRAKEN_ARABIC_MODEL", BACKEND_DIR / "kraken_models" / "arabic_best.mlmodel"))
+PADDLE_ARABIC_MODEL = os.getenv("PADDLE_ARABIC_MODEL", "arabic_PP-OCRv5_mobile_rec")
 PADDLE_DET_MODEL = os.getenv("PADDLE_DET_MODEL", "PP-OCRv5_mobile_det")
 LAYOUT_MODEL_CONFIG = os.getenv(
     "LAYOUT_MODEL_CONFIG", "lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config")
@@ -106,7 +103,7 @@ _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
 @dataclass
 class EngineResult:
     """Output of one recogniser for one box."""
-    engine: str          # "UTRNet" | "Kraken"
+    engine: str          # "UTRNet" | "PaddleOCR"
     language: str        # LANG_URDU | LANG_ARABIC
     text: str
     confidence: float    # 0.0 - 1.0
@@ -269,61 +266,35 @@ class UTRNetRecognizer:
 
 
 # --------------------------------------------------------------------------- #
-# Recogniser 2: Kraken (Arabic, Naskh)
+# Recogniser 2: PaddleOCR (Arabic, Naskh)
 # --------------------------------------------------------------------------- #
-class KrakenArabicRecognizer:
-    """Kraken with the "Printed Arabic Base Model Trained on the OpenITI
-    Corpus" (arabic_best.mlmodel, DOI 10.5281/zenodo.7050296, CC0).
+class PaddleArabicRecognizer:
+    """PaddleOCR 3.x Arabic-script text-recognition model."""
 
-    Settings measured on Arabic words cut from a real book photo (letter
-    accuracy, harakat ignored):
-      * the model expects BASELINE line segmentation - a plain bounding box
-        is read much worse, so each crop gets a baseline across its width;
-      * Otsu-binarised crops read better than grayscale (84.4 % vs 81.2 %);
-      * bidi_reordering=True returns the text in logical (reading) order.
-    The confidence is the mean per-character confidence, the same kind of
-    score UTRNet reports, so the router can compare the two directly.
-    """
-
-    name = "Kraken"
+    name = "PaddleOCR"
     language = LANG_ARABIC
 
-    def __init__(self, model_path: Path = KRAKEN_ARABIC_MODEL, device: str = "cpu"):
-        if not model_path.is_file():
-            raise FileNotFoundError(
-                f"Kraken Arabic model not found at {model_path}. Run setup_backend.bat or download "
-                "https://zenodo.org/records/7050296/files/arabic_best.mlmodel into kraken_models/.")
-        from kraken.lib import models
-        from kraken import rpred
-        from kraken.containers import BaselineLine, Segmentation
-        self._rpred, self._line, self._segmentation = rpred.rpred, BaselineLine, Segmentation
-        self.model_name = f"kraken {model_path.name}"
-        self.net = models.load_any(str(model_path), device=device)
+    def __init__(self, model_name: str = PADDLE_ARABIC_MODEL, device: str = "cpu"):
+        # Skip PaddleX's network probe of model mirrors on every start-up.
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        from paddleocr import TextRecognition
+        self.model_name = model_name
+        self.model = TextRecognition(model_name=model_name, device=device,
+                                     cpu_threads=CPU_THREADS)
         self._lock = threading.Lock()
-        logger.info("Kraken Arabic recogniser loaded: %s", model_path)
-
-    def _read_one(self, gray: np.ndarray) -> EngineResult:
-        from PIL import Image
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        image = Image.fromarray(binary)
-        w, h = image.size
-        y = int(h * 0.7)                                   # baseline in the lower part
-        line = self._line(id="line", baseline=[(0, y), (w - 1, y)],
-                          boundary=[(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1), (0, 0)])
-        segmentation = self._segmentation(type="baselines", imagename="crop",
-                                          text_direction="horizontal-rl",
-                                          script_detection=False, lines=[line])
-        record = next(self._rpred(self.net, image, segmentation, bidi_reordering=True))
-        # The model outputs NFD (decomposed) text; the rest of the app uses NFC.
-        text = unicodedata.normalize("NFC", record.prediction).strip()
-        conf = float(np.mean(record.confidences)) if text and record.confidences else 0.0
-        return EngineResult(self.name, self.language, text, conf)
+        logger.info("PaddleOCR recogniser loaded: %s", model_name)
 
     def recognize_batch(self, images: Sequence[np.ndarray]) -> List[EngineResult]:
+        if not images:
+            return []
+        bgr = [cv2.cvtColor(g, cv2.COLOR_GRAY2BGR) for g in images]
+        with self._lock:
+            outputs = self.model.predict(input=bgr, batch_size=min(8, len(bgr)))
         results = []
-        for gray in images:
-            with self._lock:
-                results.append(self._read_one(gray))
+        for out in outputs:
+            text = str(out["rec_text"]).strip()
+            conf = float(out["rec_score"]) if text else 0.0
+            results.append(EngineResult(self.name, self.language, text, conf))
         return results
 
 
@@ -1023,7 +994,7 @@ class OcrPipeline:
         t0 = time.perf_counter()
         use_gpu = device == "gpu"
         self.urdu = UTRNetRecognizer(device="cuda" if use_gpu else "cpu")
-        self.arabic = KrakenArabicRecognizer(device="cuda" if use_gpu else "cpu")
+        self.arabic = PaddleArabicRecognizer(device="gpu:0" if use_gpu else "cpu")
         self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
         # Two workers: one per engine, so both read the same boxes concurrently.
@@ -1200,7 +1171,7 @@ class OcrPipeline:
         return (1, 3) if ip.text_runs_vertically(binary) else (0, 2)
 
     def _is_upside_down(self, pre: ip.PreprocessResult, boxes: List[ip.Box]) -> bool:
-        """Read a sample of the DETECTED text boxes with the Kraken Arabic
+        """Read a sample of the DETECTED text boxes with the fast PaddleOCR
         recogniser as they are and turned 180 deg. Upside-down Arabic-script
         text gets a clearly lower confidence. Using detector boxes (not raw
         ink) keeps page borders and background patterns out of the test."""

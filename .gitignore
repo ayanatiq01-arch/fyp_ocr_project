@@ -25,5 +25,5 @@ backend_api/server.log
 # ---- Secrets (never commit API keys) ----
 backend_api/.env
 
-# ---- Downloaded models (setup_backend.bat fetches them) ----
+# ---- Downloaded models (not part of the repo) ----
 backend_api/kraken_models/
