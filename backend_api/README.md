@@ -65,16 +65,16 @@ curl -N -F "file=@page.jpg" http://localhost:8000/api/v1/ocr/stream  # live even
 
 The stream sends a `layout` event first (all boxes, no text), then one `cell` event per box in reading order, then `done` with the object above. All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image.
 
-## Arabic post-correction with OpenAI (optional, Step 2)
+## Arabic post-correction (internal Step 2)
 
-Every **Arabic** box is sent to OpenAI `gpt-4o-mini`, whichever engine read it. A box counts as Arabic when the router chose PaddleOCR, **or** when `looks_arabic()` says so: the text has no Urdu-only letter (ٹ ڈ ڑ ں ھ ے ۓ) and at least one haraka per five letters. That rule was 30/30 correct on the test pages. Such boxes are also labelled `arabic`. The accepted text is the one that gets sent. The system prompt is in `LLM_SYSTEM_PROMPT` in `ocr_pipeline.py`. The corrected text replaces the raw text, and `candidates` in the JSON keep the raw OCR. Cells that were corrected have `"llm_corrected": true`.
+Every Arabic box goes through an internal correction step before it is returned. A box counts as Arabic when the router chose PaddleOCR, or when `looks_arabic()` detects Arabic script with harakat.
 
+- **How it runs.** The private function `_correct_arabic_text()` in `ocr_pipeline.py` sends the box's OCR text to OpenAI `gpt-6-luna` (reasoning `none`, temperature 0). Only the pipeline calls it; `main.py` never does, and the API response contains only the final text.
+- **Low confidence.** Boxes read with confidence below 0.4 are not sent; they are marked `"low_confidence": true`.
+- **Failures.** Any error (no key, network, quota, invalid key) silently keeps the raw OCR text. Use `LOG_LEVEL=DEBUG` to see each correction in the server log.
 - **Switch it off:** set `USE_LLM_CORRECTION = False` at the top of `ocr_pipeline.py`.
-- **API key:** put it in `backend_api/.env` (see `.env.example`), as `OPENAI_API_KEY=sk-...`. The file is git-ignored.
-- **Failures:** with no key, a network error, exhausted quota or an invalid key, the raw PaddleOCR text is used. The server never crashes. Every API call and every failure is logged in the server output.
-- **Limits.**
-  - Arabic printed *without* harakat is only sent when PaddleOCR wins.
-  - The LLM may "complete" a Quranic verse from memory beyond the words on the page. For example, it added `هُوَ` at the end of a line that ends in `لا اله الا`. Check critical text.
+- **API key:** put it in `backend_api/.env` (`OPENAI_API_KEY=sk-...`, see `.env.example`). The file is git-ignored.
+- **Limit.** The model may "complete" a Quranic verse from memory, so check critical text.
 
 ## Configuration (environment variables)
 

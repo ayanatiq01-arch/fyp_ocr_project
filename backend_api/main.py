@@ -75,8 +75,8 @@ class CellOut(BaseModel):
     confidence: float = Field(..., description="0-100, of the accepted engine")
     candidates: Dict[str, Candidate] = Field(
         default_factory=dict, description="Both engines' raw results, keyed by language")
-    llm_corrected: bool = Field(False, description="Arabic text was corrected by OpenAI "
-                                                   "(Step 2); candidates keep the raw OCR")
+    low_confidence: bool = Field(False, description="Arabic box read with confidence "
+                                                    "below 0.4 - text may be unreliable")
 
 
 class RowOut(BaseModel):
@@ -141,7 +141,7 @@ def cell_out(pre: ip.PreprocessResult, cell: Cell) -> CellOut:
         confidence=_pct(cell.confidence),
         candidates={lang: Candidate(text=c.text, confidence=_pct(c.confidence))
                     for lang, c in cell.candidates.items()},
-        llm_corrected=cell.llm_corrected,
+        low_confidence=cell.low_confidence,
     )
 
 
