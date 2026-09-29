@@ -1,0 +1,37 @@
+# Backend dependencies - versions verified together on Windows 10, Python 3.11 (CPU).
+# Install with:  setup_backend.bat   (handles the OpenCV install order, see below)
+#
+# CPU builds of PyTorch come from the PyTorch index.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- API server ---
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32          # multipart/form-data uploads
+pydantic==2.13.5
+
+# --- Arabic OCR (PaddleOCR 3.x) ---
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+paddlex==3.7.2
+
+# --- Layout analysis ---
+layoutparser==0.3.4
+
+# --- Image processing ---
+# PaddleX pins opencv-contrib-python 4.10.0.84 and LayoutParser requires
+# opencv-python. Both install the same `cv2` module, so they must be the SAME
+# version, and contrib (a superset) must be installed last - setup_backend.bat
+# does this.
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84
+numpy==2.3.5
+pillow==12.3.0
+
+# --- Urdu OCR (UTRNet, cloned repo) ---
+torch==2.14.0
+torchvision==0.29.0
+lmdb==2.3.0                       # imported by UTRNet/dataset.py
+six==1.17.0                       # imported by UTRNet/dataset.py
+pytz==2026.4                      # imported by UTRNet/utils.py
+matplotlib==3.11.2                # imported by UTRNet/utils.py

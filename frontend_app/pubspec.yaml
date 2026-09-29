@@ -1,0 +1,26 @@
+name: frontend_app
+description: Bilingual (Urdu & Arabic) OCR scanner for historical books.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  # image_picker 1.2.x requires Dart ^3.10 / Flutter >= 3.38.
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Native camera / gallery access.
+  image_picker: ^1.2.3
+  # Interactive cropping UI (uCrop on Android, TOCropViewController on iOS).
+  image_cropper: ^12.2.1
+  # Multipart HTTP upload to the FastAPI backend.
+  http: ^1.6.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

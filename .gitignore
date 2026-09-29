@@ -1,0 +1,22 @@
+# ---- Python / backend ----
+backend_api/venv/
+__pycache__/
+*.pyc
+
+# Uploaded images are temporary (folder kept via .gitkeep)
+backend_api/temp_uploads/*
+!backend_api/temp_uploads/.gitkeep
+
+# UTRNet trained weights: 190 MB, over GitHub's 100 MB file limit.
+# Download instructions: backend_api/README.md
+backend_api/UTRNet-High-Resolution-Urdu-Text-Recognition/saved_models/
+backend_api/UTRNet-High-Resolution-Urdu-Text-Recognition/read_outputs/
+
+# ---- Build artefacts (the APK is published as a GitHub Release) ----
+*.apk
+*.aab
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
