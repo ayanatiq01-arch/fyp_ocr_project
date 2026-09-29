@@ -113,6 +113,25 @@ ROUTER_URDU_MARGIN = float(os.getenv("ROUTER_URDU_MARGIN", "0.0"))
 # (page ornaments, stains, torn edges) and dropped from the final page.
 MIN_TEXT_CONFIDENCE = float(os.getenv("MIN_TEXT_CONFIDENCE", "0.5"))
 
+_HARAKAT_RE = re.compile(r"[ً-ْٰ]")          # tanween, fatha ... sukun, dagger alif
+_LETTER_RE = re.compile(r"[ء-غف-يٱ-ۓ]")
+_URDU_ONLY_RE = re.compile(r"[ٹڈڑںھےۓ]")  # ٹ ڈ ڑ ں ھ ے ۓ
+
+
+def looks_arabic(text: str) -> bool:
+    """Script-detection heuristic: is this recognised text Arabic?
+
+    Classical Arabic / Quranic print carries harakat on almost every word,
+    Urdu print rarely does, and Urdu-only letters (ٹ ڈ ڑ ں ھ ے ۓ) never occur
+    in Arabic. Arabic = no Urdu-only letter AND at least one haraka per five
+    letters. (30/30 correct on OCR output of the test pages; Arabic printed
+    WITHOUT harakat is not detected by this rule.)
+    """
+    letters = len(_LETTER_RE.findall(text))
+    return letters > 0 and not _URDU_ONLY_RE.search(text) and \
+        len(_HARAKAT_RE.findall(text)) / letters >= 0.2
+
+
 LANG_URDU = "urdu"
 LANG_ARABIC = "arabic"
 _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
@@ -1162,12 +1181,18 @@ class OcrPipeline:
                 cell.candidates = {LANG_URDU: u, LANG_ARABIC: a}
                 cell.done = True
 
-            # Step 2: OpenAI corrects the raw PaddleOCR text of every box the
-            # router accepted as Arabic. Boxes won by UTRNet are not sent:
-            # their PaddleOCR text is discarded, so correcting it would only
-            # cost time and money. Routing used the raw confidences above.
-            if self.corrector.enabled:
-                arabic_cells = [item[3] for item in chunk if item[3].engine == PaddleArabicRecognizer.name]
+            # A box is Arabic if the router chose PaddleOCR (Arabic) OR the
+            # accepted text itself looks Arabic (script-detection heuristic).
+            # The second case fixes the label of Arabic lines that UTRNet won.
+            arabic_cells = [item[3] for item in chunk if item[3].text and (
+                item[3].engine == PaddleArabicRecognizer.name or looks_arabic(item[3].text))]
+            for c in arabic_cells:
+                c.language = LANG_ARABIC
+
+            # Step 2: EVERY Arabic box - whichever engine read it - is passed
+            # through the OpenAI correction (the accepted text is sent).
+            # Routing above used the raw confidences.
+            if self.corrector.enabled and arabic_cells:
                 fixes = list(self._llm_executor.map(self.corrector.correct,
                                                     [c.text for c in arabic_cells]))
                 for c, (text, corrected) in zip(arabic_cells, fixes):

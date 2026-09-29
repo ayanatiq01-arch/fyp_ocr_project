@@ -67,12 +67,14 @@ The stream sends a `layout` event first (all boxes, no text), then one `cell` ev
 
 ## Arabic post-correction with OpenAI (optional, Step 2)
 
-Arabic text that the router accepted from PaddleOCR is sent to OpenAI `gpt-4o-mini`. The system prompt is in `LLM_SYSTEM_PROMPT` in `ocr_pipeline.py`. The corrected text replaces the raw text, and `candidates` in the JSON keep the raw OCR. Cells that were corrected have `"llm_corrected": true`.
+Every **Arabic** box is sent to OpenAI `gpt-4o-mini`, whichever engine read it. A box counts as Arabic when the router chose PaddleOCR, **or** when `looks_arabic()` says so: the text has no Urdu-only letter (ٹ ڈ ڑ ں ھ ے ۓ) and at least one haraka per five letters. That rule was 30/30 correct on the test pages. Such boxes are also labelled `arabic`. The accepted text is the one that gets sent. The system prompt is in `LLM_SYSTEM_PROMPT` in `ocr_pipeline.py`. The corrected text replaces the raw text, and `candidates` in the JSON keep the raw OCR. Cells that were corrected have `"llm_corrected": true`.
 
 - **Switch it off:** set `USE_LLM_CORRECTION = False` at the top of `ocr_pipeline.py`.
 - **API key:** put it in `backend_api/.env` (see `.env.example`), as `OPENAI_API_KEY=sk-...`. The file is git-ignored.
 - **Failures:** with no key, a network error, exhausted quota or an invalid key, the raw PaddleOCR text is used. The server never crashes. Every API call and every failure is logged in the server output.
-- **Boxes won by UTRNet are not sent.** Their PaddleOCR text is discarded by the router, so correcting it would only cost time and money.
+- **Limits.**
+  - Arabic printed *without* harakat is only sent when PaddleOCR wins.
+  - The LLM may "complete" a Quranic verse from memory beyond the words on the page. For example, it added `هُوَ` at the end of a line that ends in `لا اله الا`. Check critical text.
 
 ## Configuration (environment variables)
 
