@@ -20,3 +20,4 @@ backend_api/UTRNet-High-Resolution-Urdu-Text-Recognition/read_outputs/
 .DS_Store
 Thumbs.db
 .vscode/
+backend_api/server.log

@@ -5,25 +5,28 @@ ocr_pipeline.py
 Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline with a
 **Confidence Score Routing Algorithm**.
 
-    uploaded image
+    uploaded photo (whole page - no manual cropping needed)
         │
         ▼
-    image_processing.preprocess()      deskew · shadow removal · denoise · binarise
+    orientation + image_processing.preprocess()   0/90/180/270 · deskew · shadows · denoise
         │
         ▼
-    LayoutAnalyzer (LayoutParser)      paragraph / title / list blocks (x, y)
+    TextDetector (PaddleOCR DB)          AUTO-CROP: one box per text line / table cell
         │
         ▼
-    segment_lines()                    each block -> text lines
-        │
-        ├──► UTRNetRecognizer   (Urdu)    ─┐  run concurrently on the same lines
-        └──► PaddleArabicRecognizer (Ar.) ─┘
+    build_layout()                       boxes -> rows -> blocks (paragraph / list /
+        │                                table / title) + LayoutParser block hints
+        ▼
+    for every box, in reading order:
+        ├──► UTRNetRecognizer        (Urdu)    ─┐  run at the same time
+        └──► PaddleArabicRecognizer  (Arabic)  ─┘
                         │
                         ▼
                 route_by_confidence()     higher confidence wins, other discarded
                         │
                         ▼
-               blocks + lines + formatted text (paragraphs / bullets preserved)
+    results are streamed as they are ready; finally the page is re-assembled
+    with its paragraphs, bullets and table columns.
 
 Why confidences are comparable
 ------------------------------
@@ -32,13 +35,13 @@ max softmax probability over the frames that survive CTC decoding (non-blank,
 not a repeat). :class:`UTRNetRecognizer` computes its score **the same way**,
 so the two numbers are on the same 0-1 scale and can be compared directly.
 
-Models (nothing is invented - both are downloaded/used as published):
+Models (all published, downloaded as-is):
 * UTRNet-Large  - ``UTRNet-High-Resolution-Urdu-Text-Recognition/saved_models/
   UTRNet-Large/best_norm_ED.pth`` (from the UTRNet README, Google Drive link).
-* PaddleOCR     - ``arabic_PP-OCRv5_mobile_rec`` (PaddleOCR 3.x official model,
-  auto-downloaded to ``~/.paddlex/official_models`` on first run).
-* LayoutParser  - ``lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config``
-  (PaddleDetection PubLayNet model, auto-downloaded on first run).
+* PaddleOCR     - ``arabic_PP-OCRv5_mobile_rec`` (recognition) and
+  ``PP-OCRv5_mobile_det`` (text detection), auto-downloaded to
+  ``~/.paddlex/official_models`` on first run.
+* LayoutParser  - ``lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config``.
 """
 
 from __future__ import annotations
@@ -53,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -73,6 +76,7 @@ UTRNET_WEIGHTS = Path(os.getenv(
 UTRNET_GLYPHS = UTRNET_DIR / "UrduGlyphs.txt"
 
 PADDLE_ARABIC_MODEL = os.getenv("PADDLE_ARABIC_MODEL", "arabic_PP-OCRv5_mobile_rec")
+PADDLE_DET_MODEL = os.getenv("PADDLE_DET_MODEL", "PP-OCRv5_mobile_det")
 LAYOUT_MODEL_CONFIG = os.getenv(
     "LAYOUT_MODEL_CONFIG", "lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config")
 LAYOUT_SCORE_THRESHOLD = float(os.getenv("LAYOUT_SCORE_THRESHOLD", "0.5"))
@@ -84,9 +88,13 @@ TORCH_THREADS = int(os.getenv("TORCH_THREADS", str(os.cpu_count() or 4)))
 CPU_THREADS = int(os.getenv("OCR_CPU_THREADS", str(max(1, (os.cpu_count() or 4) // 2))))
 # Router calibration (see route_by_confidence). 0.0 = pure score comparison.
 ROUTER_URDU_MARGIN = float(os.getenv("ROUTER_URDU_MARGIN", "0.0"))
+# Results below this confidence (from BOTH engines) are treated as non-text
+# (page ornaments, stains, torn edges) and dropped from the final page.
+MIN_TEXT_CONFIDENCE = float(os.getenv("MIN_TEXT_CONFIDENCE", "0.5"))
 
 LANG_URDU = "urdu"
 LANG_ARABIC = "arabic"
+_ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
 
 
 # --------------------------------------------------------------------------- #
@@ -94,7 +102,7 @@ LANG_ARABIC = "arabic"
 # --------------------------------------------------------------------------- #
 @dataclass
 class EngineResult:
-    """Output of one recogniser for one line image."""
+    """Output of one recogniser for one box."""
     engine: str          # "UTRNet" | "PaddleOCR"
     language: str        # LANG_URDU | LANG_ARABIC
     text: str
@@ -102,39 +110,58 @@ class EngineResult:
 
 
 @dataclass
-class RoutedLine:
-    """A text line after confidence routing."""
-    box: ip.Box                  # on the pre-processed image
-    text: str
-    language: str
-    engine: str
-    confidence: float            # 0.0 - 1.0 (of the accepted engine)
-    candidates: Dict[str, EngineResult]
+class Cell:
+    """One auto-cropped text box (a line, part of a line, or a table cell)."""
+    box: ip.Box                            # on the pre-processed image
+    column: int = 0                        # table column (0 = right-most)
+    text: str = ""
+    language: str = "unknown"
+    engine: str = ""
+    confidence: float = 0.0                # of the accepted engine, 0-1
+    candidates: Dict[str, EngineResult] = field(default_factory=dict)
+    done: bool = False
+
+
+@dataclass
+class Row:
+    """Cells that sit on the same printed line, ordered right-to-left."""
+    box: ip.Box
+    cells: List[Cell] = field(default_factory=list)
     is_bullet: bool = False
+
+    def text(self, table: bool = False, columns: int = 0) -> str:
+        if table:
+            slots = [""] * max(columns, 1)
+            for c in self.cells:
+                if c.text:
+                    slots[c.column] = (slots[c.column] + " " + c.text).strip()
+            return "\t".join(slots).rstrip("\t")
+        return " ".join(c.text for c in self.cells if c.text)
 
 
 @dataclass
 class Block:
-    """A layout region (paragraph, title, list ...)."""
-    box: ip.Box                  # on the pre-processed image
-    type: str                    # "Text" | "Title" | "List"
-    score: float = 1.0
-    lines: List[RoutedLine] = field(default_factory=list)
+    """A layout region: paragraph ("Text"), "Title", "List" or "Table"."""
+    box: ip.Box
+    type: str = "Text"
+    rows: List[Row] = field(default_factory=list)
+    columns: int = 1
 
     @property
     def language(self) -> str:
-        langs = {l.language for l in self.lines if l.text}
+        langs = {c.language for r in self.rows for c in r.cells if c.text}
         if not langs:
             return "unknown"
         return langs.pop() if len(langs) == 1 else "mixed"
 
     def text(self) -> str:
-        """Block text with one output line per detected line."""
+        """One output line per printed line; tables use TAB between columns,
+        list items start with '• '."""
         out = []
-        for line in self.lines:
-            if not line.text:
-                continue
-            out.append(f"• {line.text}" if line.is_bullet else line.text)
+        for row in self.rows:
+            t = row.text(table=self.type == "Table", columns=self.columns)
+            if t.strip():
+                out.append(f"• {t}" if row.is_bullet else t)
         return "\n".join(out)
 
 
@@ -142,18 +169,19 @@ class Block:
 # Recogniser 1: UTRNet (Urdu, Nastaliq)
 # --------------------------------------------------------------------------- #
 class UTRNetRecognizer:
-    """Thin inference wrapper around the cloned UTRNet repository.
+    """Inference wrapper around the cloned UTRNet repository.
 
-    Uses the repository's own ``Model``, ``CTCLabelConverter`` and
-    ``NormalizePAD`` so pre-processing matches ``read.py`` exactly
-    (grayscale, horizontal flip, resize to height 32, right-pad to 400).
+    Pre-processing follows ``read.py`` (grayscale, horizontal flip, height 32,
+    normalise to [-1, 1]) with one speed change: instead of right-padding
+    every image to 400 px, each image is padded only to the next multiple of
+    16 (HRNet's down-sampling factor). HRNet cost grows with width, so short
+    words / table cells are ~4x faster; accuracy on real book cells was the
+    same or better in our tests.
     """
 
     name = "UTRNet"
     language = LANG_URDU
-
-    # Same hyper-parameters as read.py / README for UTRNet-Large.
-    IMG_H, IMG_W = 32, 400
+    IMG_H, MAX_W = 32, 400
 
     def __init__(self, weights: Path = UTRNET_WEIGHTS, device: str = "cpu"):
         if not weights.is_file():
@@ -168,7 +196,6 @@ class UTRNetRecognizer:
         import torch
         from model import Model                       # UTRNet/model.py
         from utils import CTCLabelConverter           # UTRNet/utils.py
-        from dataset import NormalizePAD              # UTRNet/dataset.py
 
         self._torch = torch
         torch.set_num_threads(TORCH_THREADS)
@@ -180,7 +207,7 @@ class UTRNetRecognizer:
 
         opt = SimpleNamespace(
             FeatureExtraction="HRNet", SequenceModeling="DBiLSTM", Prediction="CTC",
-            imgH=self.IMG_H, imgW=self.IMG_W, batch_max_length=100, num_fiducial=20,
+            imgH=self.IMG_H, imgW=self.MAX_W, batch_max_length=100, num_fiducial=20,
             input_channel=1, output_channel=32,  # read.py forces 32 for HRNet
             hidden_size=256, num_class=len(self.converter.character),
             device=self.device, rgb=False,
@@ -189,8 +216,6 @@ class UTRNetRecognizer:
         state = torch.load(str(weights), map_location=self.device, weights_only=True)
         self.model.load_state_dict(state)
         self.model.eval()
-
-        self.transform = NormalizePAD((1, self.IMG_H, self.IMG_W))
         # UTRNet's test-time "temporal dropout" draws from NumPy's global RNG;
         # we seed it per call (under a lock) so results are reproducible.
         self._lock = threading.Lock()
@@ -198,43 +223,44 @@ class UTRNetRecognizer:
 
     def _to_tensor(self, gray: np.ndarray):
         from PIL import Image
-        img = Image.fromarray(gray).convert("L")
-        img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)   # as in read.py
-        w, h = img.size
-        resized_w = min(self.IMG_W, max(1, int(np.ceil(self.IMG_H * w / float(h)))))
-        img = img.resize((resized_w, self.IMG_H), Image.Resampling.BICUBIC)
-        return self.transform(img)
-
-    def recognize_batch(self, lines: Sequence[np.ndarray]) -> List[EngineResult]:
-        """Recognise a batch of grayscale line images."""
-        if not lines:
-            return []
         torch = self._torch
-        batch = torch.stack([self._to_tensor(g) for g in lines]).to(self.device)
+        img = Image.fromarray(gray).convert("L")
+        img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)          # as in read.py
+        w, h = img.size
+        new_w = min(self.MAX_W, max(16, int(np.ceil(self.IMG_H * w / float(h)))))
+        img = img.resize((new_w, self.IMG_H), Image.Resampling.BICUBIC)
+        x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)
+        x = x.sub_(0.5).div_(0.5)[None, None]                          # [1,1,H,W]
+        padded_w = -(-new_w // 16) * 16
+        if padded_w != new_w:  # replicate last column, like NormalizePAD
+            x = torch.cat([x, x[..., -1:].expand(1, 1, self.IMG_H, padded_w - new_w)], dim=3)
+        return x.to(self.device)
 
-        with self._lock, torch.no_grad():
-            rng_state = np.random.get_state()
-            np.random.seed(0)
-            try:
-                logits = self.model(batch)                 # [B, T, C]
-            finally:
-                np.random.set_state(rng_state)
+    def _decode(self, logits) -> Tuple[str, float]:
+        probs = self._torch.softmax(logits, dim=2)
+        max_probs, indices = probs.max(dim=2)
+        chars, char_probs, prev = [], [], 0
+        for p, i in zip(max_probs[0].cpu().numpy(), indices[0].cpu().numpy()):
+            if i != 0 and i != prev:           # standard CTC greedy decoding
+                chars.append(self.converter.character[i])
+                char_probs.append(float(p))
+            prev = i
+        text = "".join(chars).strip()
+        return text, (float(np.mean(char_probs)) if char_probs and text else 0.0)
 
-        probs = torch.softmax(logits, dim=2)
-        max_probs, indices = probs.max(dim=2)             # [B, T]
-        max_probs, indices = max_probs.cpu().numpy(), indices.cpu().numpy()
-
+    def recognize_batch(self, images: Sequence[np.ndarray]) -> List[EngineResult]:
+        """Recognise grayscale crops (each at its own width)."""
         results = []
-        for p_row, i_row in zip(max_probs, indices):
-            # Standard CTC greedy decoding; keep the prob of every emitted char.
-            chars, char_probs, prev = [], [], 0
-            for p, i in zip(p_row, i_row):
-                if i != 0 and i != prev:
-                    chars.append(self.converter.character[i])
-                    char_probs.append(float(p))
-                prev = i
-            text = "".join(chars).strip()
-            conf = float(np.mean(char_probs)) if char_probs and text else 0.0
+        for gray in images:
+            x = self._to_tensor(gray)
+            with self._lock, self._torch.no_grad():
+                rng_state = np.random.get_state()
+                np.random.seed(0)
+                try:
+                    logits = self.model(x)
+                finally:
+                    np.random.set_state(rng_state)
+            text, conf = self._decode(logits)
             results.append(EngineResult(self.name, self.language, text, conf))
         return results
 
@@ -243,8 +269,7 @@ class UTRNetRecognizer:
 # Recogniser 2: PaddleOCR (Arabic, Naskh)
 # --------------------------------------------------------------------------- #
 class PaddleArabicRecognizer:
-    """PaddleOCR 3.x text-recognition model for Arabic script (lines only;
-    detection is done by our own layout + line segmentation)."""
+    """PaddleOCR 3.x Arabic-script text-recognition model."""
 
     name = "PaddleOCR"
     language = LANG_ARABIC
@@ -259,11 +284,10 @@ class PaddleArabicRecognizer:
         self._lock = threading.Lock()
         logger.info("PaddleOCR recogniser loaded: %s", model_name)
 
-    def recognize_batch(self, lines: Sequence[np.ndarray]) -> List[EngineResult]:
-        """Recognise a batch of grayscale line images."""
-        if not lines:
+    def recognize_batch(self, images: Sequence[np.ndarray]) -> List[EngineResult]:
+        if not images:
             return []
-        bgr = [cv2.cvtColor(g, cv2.COLOR_GRAY2BGR) for g in lines]
+        bgr = [cv2.cvtColor(g, cv2.COLOR_GRAY2BGR) for g in images]
         with self._lock:
             outputs = self.model.predict(input=bgr, batch_size=min(8, len(bgr)))
         results = []
@@ -275,22 +299,101 @@ class PaddleArabicRecognizer:
 
 
 # --------------------------------------------------------------------------- #
+# Auto-crop: text detection
+# --------------------------------------------------------------------------- #
+class TextDetector:
+    """Finds every text line / table cell on the page (PaddleOCR DB detector).
+
+    This is the automatic crop: the user photographs the whole page and each
+    returned box is read separately. Settings were tuned on a real book page:
+    ``unclip_ratio=1.0`` keeps boxes tight so neighbouring rows with heavy
+    harakat do not merge, ``limit_side_len=1280`` gives enough resolution to
+    separate table cells.
+    """
+
+    def __init__(self, model_name: str = PADDLE_DET_MODEL, device: str = "cpu"):
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        from paddleocr import TextDetection
+        # enable_mkldnn=False: Paddle 3.3's oneDNN path fails on this model
+        # ("ConvertPirAttribute2RuntimeAttribute not support").
+        self.model = TextDetection(
+            model_name=model_name, device=device, cpu_threads=CPU_THREADS,
+            enable_mkldnn=False, limit_side_len=1280, limit_type="max",
+            thresh=0.3, box_thresh=0.5, unclip_ratio=1.0)
+        self._lock = threading.Lock()
+        logger.info("PaddleOCR text detector loaded: %s", model_name)
+
+    def detect(self, gray: np.ndarray, binary: np.ndarray) -> List[ip.Box]:
+        with self._lock:
+            out = self.model.predict(input=cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))[0]
+        h, w = gray.shape[:2]
+        boxes: List[ip.Box] = []
+        for poly in out["dt_polys"]:
+            p = np.asarray(poly)
+            x1, y1 = np.floor(p.min(axis=0)).astype(int)
+            x2, y2 = np.ceil(p.max(axis=0)).astype(int)
+            box = (max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+            if box[2] - box[0] >= 6 and box[3] - box[1] >= 6:
+                boxes.append(box)
+        if not boxes:
+            return self._fallback(binary, [])
+        return self._fallback(binary, self._split_tall(binary, boxes))
+
+    @staticmethod
+    def _split_tall(binary: np.ndarray, boxes: List[ip.Box]) -> List[ip.Box]:
+        """A box much taller than a typical line holds several merged lines:
+        split it with the projection-profile line segmenter."""
+        median_h = float(np.median([b[3] - b[1] for b in boxes]))
+        result = []
+        for b in boxes:
+            if b[3] - b[1] > 1.8 * median_h:
+                bands = ip.segment_lines(ip.crop(binary, b))
+                if len(bands) >= 2:
+                    result.extend((b[0], b[1] + t, b[2], b[1] + bt) for t, bt in bands)
+                    continue
+            result.append(b)
+        return result
+
+    @staticmethod
+    def _fallback(binary: np.ndarray, boxes: List[ip.Box]) -> List[ip.Box]:
+        """Safety net: text the detector missed is found with OpenCV on the
+        ink that is not covered by any box. Small leftovers (harakat, dots
+        just outside a tight box) are ignored."""
+        median_h = float(np.median([b[3] - b[1] for b in boxes])) if boxes else 0.0
+        uncovered = binary.copy()
+        for b in boxes:
+            uncovered[b[1]:b[3], b[0]:b[2]] = 255
+        extra = []
+        for para in ip.detect_paragraphs(uncovered):
+            para_bin = ip.crop(uncovered, para)
+            for top, bottom in ip.segment_lines(para_bin) or [(0, para[3] - para[1])]:
+                ink = ip.ink_bounds(para_bin[top:bottom])
+                if ink is None:
+                    continue
+                box = (para[0] + ink[0], para[1] + top + ink[1], para[0] + ink[2], para[1] + top + ink[3])
+                bh, bw = box[3] - box[1], box[2] - box[0]
+                if median_h == 0 or (bh >= 0.5 * median_h and bw >= 0.5 * median_h):
+                    extra.append(box)
+        if extra:
+            logger.info("detector fallback added %d boxes", len(extra))
+        return boxes + extra
+
+
+# --------------------------------------------------------------------------- #
 # THE ROUTER - Confidence Score Routing Algorithm
 # --------------------------------------------------------------------------- #
 def route_by_confidence(urdu: EngineResult, arabic: EngineResult,
                         urdu_margin: float = ROUTER_URDU_MARGIN
                         ) -> Tuple[EngineResult, EngineResult]:
-    """Pick the language of a line by comparing the two engines' confidences.
+    """Pick the language of a box by comparing the two engines' confidences.
 
     No language classifier is trained. Each engine only knows its own script
-    well, so the engine that is *more confident* about the line is taken to
+    well, so the engine that is *more confident* about the box is taken to
     be reading the correct language. The other result is discarded.
 
     ``urdu_margin`` (default 0.0 = plain comparison) is an optional
-    calibration offset subtracted from UTRNet's score before comparing. UTRNet
-    tends to be very confident even on Arabic Naskh lines, so on a labelled
-    validation set a small margin (e.g. 0.05-0.10) may improve the *language*
-    decision. Tune it on real book pages; do not guess it.
+    calibration offset subtracted from UTRNet's score before comparing.
+    Tune it on a labelled validation set; do not guess it.
 
     Ties go to Urdu (UTRNet), the primary language of the target books.
 
@@ -307,27 +410,28 @@ def route_by_confidence(urdu: EngineResult, arabic: EngineResult,
 
 
 # --------------------------------------------------------------------------- #
-# Layout analysis (LayoutParser + OpenCV safety net)
+# LayoutParser (block-type hints)
 # --------------------------------------------------------------------------- #
 class LayoutAnalyzer:
-    """Detects paragraph / title / list regions and their coordinates.
+    """LayoutParser PaddleDetection PubLayNet model.
 
-    Primary engine: LayoutParser's PaddleDetection PubLayNet model.
-    Any ink the model misses (e.g. unusual historical layouts) is grouped into
-    extra blocks with a morphological OpenCV fallback, so no text is lost.
+    Used for block *types* (Title / List) when it recognises a region. The
+    model was trained on English research papers and usually finds nothing on
+    Urdu/Arabic book pages, so the page structure itself comes from
+    :func:`build_layout`; the pipeline never depends on this model alone.
     """
 
     LABEL_MAP = {0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
 
     def __init__(self):
         self.model = None
-        self.engine = "opencv-fallback"
+        self.engine = "unavailable"
         try:
             self.model = self._load_layoutparser()
             self.engine = "layoutparser-paddledetection"
             logger.info("LayoutParser model loaded: %s", LAYOUT_MODEL_CONFIG)
         except Exception:  # network error, missing package ...
-            logger.exception("LayoutParser unavailable - using OpenCV block detection only")
+            logger.exception("LayoutParser unavailable - continuing without block-type hints")
         self._lock = threading.Lock()
 
     @staticmethod
@@ -360,87 +464,154 @@ class LayoutAnalyzer:
             extra_config={"threshold": LAYOUT_SCORE_THRESHOLD, "thread_num": CPU_THREADS},
         )
 
-    # ------------------------------------------------------------------ API
-    def detect(self, color_bgr: np.ndarray, binary: np.ndarray) -> List[Block]:
-        """Return text blocks in reading order.
-
-        Note: the PubLayNet model was trained on English research papers. On
-        Urdu/Arabic book photos it often returns nothing, or labels the whole
-        page "Figure"; those regions are then handled by the OpenCV paragraph
-        detector, so the result never depends on the model alone.
-        """
-        h, w = binary.shape[:2]
-        blocks: List[Block] = []
-
-        if self.model is not None:
-            rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)  # model expects RGB
-            with self._lock:
-                layout = self.model.detect(rgb)
-            for tb in layout:
-                if tb.type == "Figure":
-                    continue  # no text to OCR; any real text in it is picked up below
-                x1, y1, x2, y2 = (int(round(v)) for v in tb.coordinates)
-                box = (max(0, x1), max(0, y1), min(w, x2), min(h, y2))
-                if box[2] <= box[0] or box[3] <= box[1]:
-                    continue
-                btype = "Text" if tb.type == "Table" else tb.type
-                # The model may put several paragraphs in one box: split it
-                # at paragraph gaps so the page structure is preserved.
-                sub = ip.detect_paragraphs(ip.crop(binary, box))
-                for sx1, sy1, sx2, sy2 in sub or [(0, 0, box[2] - box[0], box[3] - box[1])]:
-                    blocks.append(Block(box=(box[0] + sx1, box[1] + sy1, box[0] + sx2, box[1] + sy2),
-                                        type=btype, score=float(tb.score)))
-            blocks = self._suppress_duplicates(blocks)
-
-        # Safety net: text not covered by any model block.
-        uncovered = binary.copy()
-        for b in blocks:
-            uncovered[b.box[1]:b.box[3], b.box[0]:b.box[2]] = 255
-        blocks.extend(Block(box=box, type="Text", score=0.0)
-                      for box in ip.detect_paragraphs(uncovered))
-
-        # Tighten every box to its ink; drop empty or hair-thin artefacts.
-        tightened = []
-        for b in blocks:
-            ink = ip.ink_bounds(ip.crop(binary, b.box))
-            if ink is None:
+    def detect(self, color_bgr: np.ndarray) -> List[Tuple[ip.Box, str]]:
+        """Return (box, type) for Title / List / Text / Table regions."""
+        if self.model is None:
+            return []
+        rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)  # model expects RGB
+        with self._lock:
+            layout = self.model.detect(rgb)
+        regions = []
+        for tb in layout:
+            if tb.type == "Figure":
                 continue
-            x1, y1 = b.box[0] + ink[0], b.box[1] + ink[1]
-            b.box = (x1, y1, x1 + ink[2] - ink[0], y1 + ink[3] - ink[1])
-            if min(b.box[2] - b.box[0], b.box[3] - b.box[1]) >= 8:
-                tightened.append(b)
-        return self._reading_order(tightened)
+            x1, y1, x2, y2 = (int(round(v)) for v in tb.coordinates)
+            regions.append(((x1, y1, x2, y2), tb.type))
+        return regions
 
-    # ------------------------------------------------------------ helpers
-    @staticmethod
-    def _suppress_duplicates(blocks: List[Block]) -> List[Block]:
-        """Drop blocks that mostly lie inside a higher-scoring block."""
-        kept: List[Block] = []
-        for b in sorted(blocks, key=lambda b: b.score, reverse=True):
-            if all(ip.boxes_overlap_ratio(b.box, k.box) < 0.7 for k in kept):
-                kept.append(b)
-        return kept
 
-    @staticmethod
-    def _reading_order(blocks: List[Block]) -> List[Block]:
-        """Top-to-bottom; blocks side by side on the same row are read
-        right-to-left (RTL). A block joins a row only if it overlaps *every*
-        block already in that row by more than half of the smaller height."""
-        def v_overlap(a: Block, b: Block) -> bool:
-            ov = min(a.box[3], b.box[3]) - max(a.box[1], b.box[1])
-            return ov > 0.5 * min(a.box[3] - a.box[1], b.box[3] - b.box[1])
+# --------------------------------------------------------------------------- #
+# Page structure: boxes -> rows -> blocks (paragraph / list / table / title)
+# --------------------------------------------------------------------------- #
+def _group_rows(boxes: List[ip.Box], line_h: float) -> List[Row]:
+    """Chain boxes into printed lines, right-to-left.
 
-        blocks = sorted(blocks, key=lambda b: b.box[1])
-        rows: List[List[Block]] = []
-        for b in blocks:
-            if rows and all(v_overlap(b, other) for other in rows[-1]):
-                rows[-1].append(b)
-            else:
-                rows.append([b])
-        ordered = []
-        for row in rows:
-            ordered.extend(sorted(row, key=lambda b: b.box[2], reverse=True))
-        return ordered
+    Each box is linked to its nearest neighbour on the LEFT whose vertical
+    centre is within half a line height. Because the comparison is always
+    local (neighbour to neighbour), a line that slowly drifts up or down
+    across a curved book page still stays one row, while a global "same y"
+    test would split it or merge it with the next row.
+    """
+    n = len(boxes)
+    cy = [(b[1] + b[3]) / 2 for b in boxes]
+    max_gap = 8 * line_h                   # wide table gaps are still joined
+
+    # Candidate links right -> left, best (smallest cost) first.
+    links = []
+    for i, a in enumerate(boxes):
+        for j, b in enumerate(boxes):
+            if i == j:
+                continue
+            gap = a[0] - b[2]                        # b lies to the left of a
+            overlap_x = min(a[2], b[2]) - max(a[0], b[0])
+            if -0.3 * line_h <= gap <= max_gap and overlap_x < 0.5 * min(a[2] - a[0], b[2] - b[0]):
+                dy = abs(cy[i] - cy[j])
+                # 0.62: tolerates page curl, yet stays below half the usual
+                # line pitch (~1.3 line heights) so rows are not crossed.
+                if dy < 0.62 * line_h:
+                    links.append((max(gap, 0) + 4 * dy, i, j))
+    links.sort()
+
+    left_of, right_of = [None] * n, [None] * n
+    for _, i, j in links:
+        if left_of[i] is None and right_of[j] is None:
+            left_of[i], right_of[j] = j, i
+
+    rows: List[Row] = []
+    for start in range(n):
+        if right_of[start] is not None:
+            continue                                 # not the right-most box
+        cells, k = [], start
+        while k is not None:
+            cells.append(Cell(box=boxes[k]))
+            k = left_of[k]
+        rows.append(Row(box=ip.union_box([c.box for c in cells]), cells=cells))
+    # Order rows by the vertical centre of their right-most cell (start of line).
+    rows.sort(key=lambda r: (r.cells[0].box[1] + r.cells[0].box[3]) / 2)
+    return rows
+
+
+def _has_column_gap(row: Row, line_h: float) -> bool:
+    """True if two neighbouring cells are separated by a table-column gap
+    (wider than a line height), not just a word space."""
+    return any(a.box[0] - b.box[2] > 1.0 * line_h for a, b in zip(row.cells, row.cells[1:]))
+
+
+def _assign_columns(block: Block, line_h: float) -> None:
+    """Cluster cells into table columns by their RIGHT edge (Urdu/Arabic
+    text is right-aligned), 0 = right-most column."""
+    cells = [c for r in block.rows for c in r.cells]
+    edges = sorted((c.box[2] for c in cells), reverse=True)
+    columns: List[List[float]] = [[edges[0]]]
+    for x in edges[1:]:
+        if columns[-1][-1] - x > 1.0 * line_h:
+            columns.append([x])
+        else:
+            columns[-1].append(x)
+    anchors = [float(np.median(col)) for col in columns]
+    for c in cells:
+        c.column = int(np.argmin([abs(c.box[2] - a) for a in anchors]))
+    block.columns = len(anchors)
+
+
+def build_layout(boxes: List[ip.Box]) -> List[Block]:
+    """Re-create the page structure from the auto-cropped boxes.
+
+    * rows   : boxes on the same line, ordered right-to-left
+    * blocks : consecutive rows closer than ~0.8 line heights (a larger gap
+               starts a new paragraph / title / table)
+    * types  : "Table" when most rows have column gaps, "Title" for a lone
+               centred or large line (LayoutParser hints: apply_layout_hints)
+    """
+    if not boxes:
+        return []
+    # Typical line height = median box height (robust to a few merged boxes).
+    line_h = float(np.median([b[3] - b[1] for b in boxes]))
+    rows = _group_rows(boxes, line_h)
+
+    page = ip.union_box(boxes)
+    page_cx, page_w = (page[0] + page[2]) / 2, page[2] - page[0]
+
+    def is_heading(row: Row) -> bool:
+        """A single short box centred on the page (e.g. a chapter heading)."""
+        b = row.box
+        return len(row.cells) == 1 and (b[2] - b[0]) < 0.8 * page_w and \
+            abs((b[0] + b[2]) / 2 - page_cx) < 0.1 * page_w
+
+    # Consecutive rows closer than ~0.8 line heights form one block; a
+    # centred heading never merges with the block around it.
+    blocks: List[Block] = []
+    for row in rows:
+        if blocks:
+            prev = blocks[-1]
+            gap = row.box[1] - prev.rows[-1].box[3]
+            h_overlap = min(prev.box[2], row.box[2]) - max(prev.box[0], row.box[0])
+            separate = is_heading(row) != is_heading(prev.rows[-1])
+            if gap < 0.8 * line_h and h_overlap > 0 and not separate:
+                prev.rows.append(row)
+                prev.box = ip.union_box([prev.box, row.box])
+                continue
+        blocks.append(Block(box=row.box, rows=[row]))
+
+    for i, block in enumerate(blocks):
+        gapped = sum(_has_column_gap(r, line_h) for r in block.rows)
+        if len(block.rows) >= 2 and gapped >= 0.5 * len(block.rows):
+            block.type = "Table"
+            _assign_columns(block, line_h)
+        elif len(block.rows) == 1 and len(blocks) > 1 and (
+                is_heading(block.rows[0]) or
+                (i == 0 and block.box[3] - block.box[1] > 1.2 * line_h)):
+            block.type = "Title"                   # centred or large lone line
+    return blocks
+
+
+def apply_layout_hints(blocks: List[Block], hints: List[Tuple[ip.Box, str]]) -> None:
+    """Use LayoutParser's Title / List labels for plain paragraphs it covers."""
+    for block in blocks:
+        if block.type == "Text":
+            for hbox, htype in hints:
+                if htype in ("Title", "List") and ip.boxes_overlap_ratio(block.box, hbox) > 0.6:
+                    block.type = htype
 
 
 # --------------------------------------------------------------------------- #
@@ -459,7 +630,7 @@ def detect_bullet_glyph(line_binary: np.ndarray) -> bool:
     In RTL text the bullet is the right-most glyph. It is treated as a bullet
     when it is a small, solid, roughly square blob, vertically centred in the
     line and separated from the text by a clear gap. Nuqta dots are excluded
-    because they sit above/below the line centre and close to their letter.
+    because they sit close to their letter.
     """
     ink = (line_binary == 0).astype(np.uint8)
     n, _, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
@@ -495,9 +666,18 @@ def clean_bullet_text(text: str, glyph_bullet: bool) -> Tuple[str, bool]:
         return stripped, True
     if stripped and stripped[0] in "•●▪◦":
         return stripped[1:].lstrip(), True
-    if _NUMBERED_RE.match(stripped):
-        return stripped, False  # keep numbering as printed; block becomes a list
     return text, False
+
+
+def _is_noise(cell: Cell) -> bool:
+    """Page ornaments / stains read as text: both engines unsure, or output
+    with no Arabic-script letters at modest confidence."""
+    if not cell.text:
+        return True
+    best = max((c.confidence for c in cell.candidates.values()), default=0.0)
+    if best < MIN_TEXT_CONFIDENCE:
+        return True
+    return not _ARABIC_SCRIPT_RE.search(cell.text) and cell.confidence < 0.8
 
 
 # --------------------------------------------------------------------------- #
@@ -512,16 +692,19 @@ class PipelineResult:
     rotation: int = 0            # degrees CCW applied to make the page upright
 
     def formatted_text(self) -> str:
-        """Plain text that preserves the page structure:
-        blank line between blocks, one line per printed line, bullets as '• '."""
+        """Plain text that preserves the page structure: blank line between
+        blocks, one line per printed line, TAB between table columns, bullets
+        as '• '."""
         return "\n\n".join(t for t in (b.text() for b in self.blocks) if t)
 
 
 class OcrPipeline:
-    """Loads all models once and processes images end-to-end."""
+    """Loads all models once and processes whole-page photos end-to-end."""
 
-    # Line images are padded with white so glyphs do not touch the border.
-    LINE_PAD = 4
+    # Boxes sent to both engines together; also the streaming granularity.
+    CHUNK = 4
+    # Lines sampled per candidate orientation for the 0/180 decision.
+    ORIENTATION_SAMPLE_LINES = 5
 
     def __init__(self, device: str = OCR_DEVICE):
         """``device``: "cpu" or "gpu" (PyTorch 'cuda' / Paddle 'gpu:0')."""
@@ -529,72 +712,148 @@ class OcrPipeline:
         use_gpu = device == "gpu"
         self.urdu = UTRNetRecognizer(device="cuda" if use_gpu else "cpu")
         self.arabic = PaddleArabicRecognizer(device="gpu:0" if use_gpu else "cpu")
+        self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
-        # Two workers: one per engine, so both read the same lines concurrently.
+        # Two workers: one per engine, so both read the same boxes concurrently.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
+        # LayoutParser runs in the background on its own worker.
+        self._layout_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="layout")
+        self._warm_up()
         logger.info("OCR pipeline ready in %.1f s", time.perf_counter() - t0)
+
+    def _warm_up(self) -> None:
+        """Run every model once on a dummy image. Paddle and PyTorch do
+        one-off setup work on the first call; doing it at start-up keeps it
+        out of the user's first scan."""
+        page = np.full((400, 600), 255, np.uint8)
+        for y in range(60, 360, 60):
+            cv2.rectangle(page, (60, y), (540, y + 22), 0, -1)
+        line = page[50:95, 50:550]
+        self.detector.detect(page, page)
+        self.layout.detect(cv2.cvtColor(page, cv2.COLOR_GRAY2BGR))
+        self.urdu.recognize_batch([line])
+        self.arabic.recognize_batch([line])
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._layout_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ API
     def process(self, image_bgr: np.ndarray) -> PipelineResult:
+        """Run everything and return the final result."""
+        result = None
+        for event, payload in self.process_iter(image_bgr):
+            if event == "done":
+                result = payload
+        return result
+
+    def process_iter(self, image_bgr: np.ndarray
+                     ) -> Iterator[Tuple[str, object]]:
+        """Generator for streaming. Yields, in order:
+
+        ("layout", PipelineResult)            page structure, no text yet
+        ("cell",  (block_i, row_i, cell_i, Cell))   one per box, reading order
+        ("done",  PipelineResult)             final page (noise removed,
+                                              bullets marked)
+        """
         t0 = time.perf_counter()
         turns = self._detect_orientation(image_bgr)
-        pre = ip.preprocess(image_bgr, quarter_turns=turns)
-        blocks = self.layout.detect(pre.color, pre.binary)
+        pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
 
-        # 1. Segment every block into line images.
-        jobs: List[Tuple[Block, ip.Box, np.ndarray, bool]] = []
-        for block in blocks:
-            for box, gray_line, bullet in self._lines_of(block, pre):
-                jobs.append((block, box, gray_line, bullet))
+        # LayoutParser only supplies block-type hints, so it runs in the
+        # background and is applied at the end - it never delays the text.
+        fut_hints = self._layout_executor.submit(self.layout.detect, pre.color)
+        boxes = self.detector.detect(pre.gray, pre.binary)
+        blocks = build_layout(boxes)
+        result = PipelineResult(pre=pre, blocks=blocks, layout_engine=self.layout.engine,
+                                processing_ms=0, rotation=turns * 90)
+        logger.info("layout: %d boxes, %d blocks in %d ms (rotated %d deg)", len(boxes),
+                    len(blocks), (time.perf_counter() - t0) * 1000, turns * 90)
+        yield "layout", result
 
-        # 2. Send ALL lines to BOTH engines simultaneously.
-        line_images = [j[2] for j in jobs]
-        fut_urdu = self._executor.submit(self.urdu.recognize_batch, line_images)
-        fut_arabic = self._executor.submit(self.arabic.recognize_batch, line_images)
-        urdu_results, arabic_results = fut_urdu.result(), fut_arabic.result()
+        # Reading order: block by block, row by row, right-to-left in a row.
+        order = [(bi, ri, ci, cell) for bi, b in enumerate(blocks)
+                 for ri, r in enumerate(b.rows) for ci, cell in enumerate(r.cells)]
+        for start in range(0, len(order), self.CHUNK):
+            chunk = order[start:start + self.CHUNK]
+            images = [self._crop(pre, item[3].box) for item in chunk]
+            # Send the SAME crops to BOTH engines at the same time.
+            fut_u = self._executor.submit(self.urdu.recognize_batch, images)
+            fut_a = self._executor.submit(self.arabic.recognize_batch, images)
+            for (bi, ri, ci, cell), u, a in zip(chunk, fut_u.result(), fut_a.result()):
+                accepted, _ = route_by_confidence(u, a)
+                cell.text = accepted.text
+                cell.language = accepted.language if accepted.text else "unknown"
+                cell.engine = accepted.engine if accepted.text else ""
+                cell.confidence = accepted.confidence
+                cell.candidates = {LANG_URDU: u, LANG_ARABIC: a}
+                cell.done = True
+                yield "cell", (bi, ri, ci, cell)
 
-        # 3. Route each line by confidence.
-        for (block, box, _, glyph_bullet), u, a in zip(jobs, urdu_results, arabic_results):
-            accepted, _ = route_by_confidence(u, a)
-            text, is_bullet = clean_bullet_text(accepted.text, glyph_bullet)
-            block.lines.append(RoutedLine(
-                box=box, text=text, language=accepted.language if text else "unknown",
-                engine=accepted.engine if text else "", confidence=accepted.confidence,
-                candidates={LANG_URDU: u, LANG_ARABIC: a}, is_bullet=is_bullet))
-
-        # 4. Block type: a block made of bullet / numbered lines is a list.
-        for block in blocks:
-            texts = [l for l in block.lines if l.text]
-            listy = sum(1 for l in texts if l.is_bullet or _NUMBERED_RE.match(l.text))
-            if texts and listy >= max(1, len(texts) // 2) and block.type == "Text":
-                block.type = "List"
-        blocks = [b for b in blocks if any(l.text for l in b.lines)]
-
-        ms = int((time.perf_counter() - t0) * 1000)
-        logger.info("processed %d blocks / %d lines in %d ms (rotated %d deg)",
-                    len(blocks), len(jobs), ms, turns * 90)
-        return PipelineResult(pre=pre, blocks=blocks, layout_engine=self.layout.engine,
-                              processing_ms=ms, rotation=turns * 90)
+        apply_layout_hints(result.blocks, fut_hints.result())
+        self._finalise(result)
+        result.processing_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info("processed %d boxes in %d ms", len(order), result.processing_ms)
+        yield "done", result
 
     # ------------------------------------------------------------ helpers
-    # Lines sampled per candidate orientation for the 0/180 decision.
-    ORIENTATION_SAMPLE_LINES = 5
+    def _crop(self, pre: ip.PreprocessResult, box: ip.Box) -> np.ndarray:
+        """Grayscale crop with a little vertical margin (harakat that stick
+        out of the tight detector box) and a white border."""
+        h = box[3] - box[1]
+        extra = max(2, int(0.08 * h))
+        gray = ip.crop(pre.gray, (box[0], box[1] - extra, box[2], box[3] + extra))
+        return cv2.copyMakeBorder(gray, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=255)
+
+    def _finalise(self, result: PipelineResult) -> None:
+        """Drop noise, mark bullets, re-number empty structures."""
+        pre = result.pre
+        kept_blocks = []
+        for block in result.blocks:
+            kept_rows = []
+            for row in block.rows:
+                row.cells = [c for c in row.cells if not _is_noise(c)]
+                if not row.cells:
+                    continue
+                row.box = ip.union_box([c.box for c in row.cells])
+                if block.type != "Table":
+                    first = row.cells[0]                       # right-most = start of line
+                    glyph = detect_bullet_glyph(ip.crop(pre.binary, row.box))
+                    first.text, row.is_bullet = clean_bullet_text(first.text, glyph)
+                kept_rows.append(row)
+            if not kept_rows:
+                continue
+            block.rows = kept_rows
+            block.box = ip.union_box([r.box for r in kept_rows])
+            if block.type == "Text":
+                texts = [r.cells[0].text for r in kept_rows]
+                listy = sum(1 for r, t in zip(kept_rows, texts) if r.is_bullet or _NUMBERED_RE.match(t))
+                if listy >= max(1, len(kept_rows) // 2):
+                    block.type = "List"
+            kept_blocks.append(block)
+        result.blocks = kept_blocks
 
     def _detect_orientation(self, image_bgr: np.ndarray) -> int:
         """Return how many CCW quarter turns make the page upright.
 
         1. Projection profiles decide whether text lines currently run
            horizontally (candidates 0 / 180 deg) or vertically (90 / 270).
-        2. The two remaining candidates differ by 180 deg, which profiles
-           cannot tell apart. Both are read with the fast PaddleOCR Arabic-
-           script recogniser on a few of the widest lines; upside-down
-           Arabic-script text gets a much lower confidence.
+        2. The two remaining candidates differ by 180 deg. First the
+           baseline position is checked (Arabic-script ink is densest in the
+           lower part of a line). If that is not clear-cut, both candidates
+           are read with the fast PaddleOCR recogniser on a few of the widest
+           lines; upside-down text gets a much lower confidence.
         """
         gray, binary = ip.quick_binary(image_bgr)
         candidates = (1, 3) if ip.text_runs_vertically(binary) else (0, 2)
+
+        first, _ = ip.rotate90(binary, candidates[0])
+        baseline = ip.baseline_position(first)
+        if abs(baseline - 0.5) >= 0.05:
+            best = candidates[0] if baseline > 0.5 else candidates[1]
+            logger.info("orientation: candidates=%s baseline=%.2f -> rotate %d deg",
+                        [c * 90 for c in candidates], baseline, best * 90)
+            return best
 
         scores = {}
         for k in candidates:
@@ -620,20 +879,3 @@ class OcrPipeline:
                     [c * 90 for c in candidates],
                     {c * 90: round(s, 3) for c, s in scores.items()}, best * 90)
         return best
-    def _lines_of(self, block: Block, pre: ip.PreprocessResult):
-        """Yield (line_box, padded grayscale line image, has_bullet_glyph)."""
-        bx1, by1, _, _ = block.box
-        block_bin = ip.crop(pre.binary, block.box)
-        for top, bottom in ip.segment_lines(block_bin):
-            band = block_bin[top:bottom]
-            ink = ip.ink_bounds(band)
-            if ink is None:
-                continue
-            # Line box in page coordinates, trimmed horizontally to its ink.
-            box = (bx1 + ink[0], by1 + top, bx1 + ink[2], by1 + bottom)
-            if box[3] - box[1] < 8 or box[2] - box[0] < 8:
-                continue
-            gray = ip.crop(pre.gray, box)
-            gray = cv2.copyMakeBorder(gray, self.LINE_PAD, self.LINE_PAD, self.LINE_PAD,
-                                      self.LINE_PAD, cv2.BORDER_CONSTANT, value=255)
-            yield box, gray, detect_bullet_glyph(ip.crop(pre.binary, box))

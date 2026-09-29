@@ -40,6 +40,13 @@ from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
+# Phone cameras (Samsung, iPhone) often save HEIC/HEIF; teach Pillow to read it.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:  # optional dependency
+    logger.warning("pillow-heif not installed: HEIC/HEIF photos cannot be decoded")
+
 # (x1, y1, x2, y2) in pixels, x2/y2 exclusive.
 Box = Tuple[int, int, int, int]
 
@@ -86,8 +93,10 @@ def denoise(gray: np.ndarray, strength: float = 7.0) -> np.ndarray:
     """
     if strength <= 0:
         return gray
+    # searchWindowSize 11 instead of OpenCV's default 21: ~3.5x faster
+    # (cost grows with the window area) with no visible loss on text.
     return cv2.fastNlMeansDenoising(gray, None, h=float(strength),
-                                    templateWindowSize=7, searchWindowSize=21)
+                                    templateWindowSize=7, searchWindowSize=11)
 
 
 def remove_small_specks(binary: np.ndarray, min_area: int) -> np.ndarray:
@@ -355,6 +364,30 @@ def text_runs_vertically(binary: np.ndarray) -> bool:
     vertical = _line_band_score(np.ascontiguousarray(ink.T))
     logger.debug("orientation bands: horizontal=%.3f vertical=%.3f", horizontal, vertical)
     return vertical > horizontal
+
+
+def baseline_position(binary: np.ndarray) -> float:
+    """Median relative height (0 = top, 1 = bottom) of the densest ink row in
+    each text line.
+
+    Arabic-script text sits on a baseline in the lower part of the line, with
+    sparse tall ascenders above, so upright pages give values > 0.5 and
+    upside-down pages < 0.5. Returns 0.5 (undecided) if no lines are found.
+    """
+    positions = []
+    for para in detect_paragraphs(binary):
+        para_bin = crop(binary, para)
+        for top, bottom in segment_lines(para_bin):
+            band = para_bin[top:bottom]
+            ink = ink_bounds(band)
+            if ink is None:
+                continue
+            band = (band[ink[1]:ink[3]] == 0).astype(np.float32)
+            if band.shape[0] < 8 or band.sum() < 50:
+                continue
+            profile = np.convolve(band.sum(axis=1), np.ones(3) / 3, mode="same")
+            positions.append(float(np.argmax(profile)) / (len(profile) - 1))
+    return float(np.median(positions)) if positions else 0.5
 
 
 def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,

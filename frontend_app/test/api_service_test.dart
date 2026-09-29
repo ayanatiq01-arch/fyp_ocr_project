@@ -1,57 +1,56 @@
-// Parses a response captured from the real backend (POST /api/v1/ocr) to
-// make sure the Dart models stay in sync with backend_api/main.py.
+// Parses responses shaped exactly like the backend's (POST /api/v1/ocr and
+// the NDJSON stream) to keep the Dart models in sync with backend_api/main.py.
 
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend_app/api_service.dart';
 
-const _sampleResponse = r'''
+const _cell1 = '{"bbox": [1300, 300, 1500, 400], "column": 0, "text": "سَمِعَ", '
+    '"language": "urdu", "engine": "UTRNet", "confidence": 99.5, '
+    '"candidates": {"urdu": {"text": "سَمِعَ", "confidence": 99.5}, '
+    '"arabic": {"text": "سَمع", "confidence": 79.0}}}';
+const _cell2 = '{"bbox": [900, 300, 1200, 400], "column": 1, "text": "اس نے سنا", '
+    '"language": "urdu", "engine": "UTRNet", "confidence": 97.0, '
+    '"candidates": {"urdu": {"text": "اس نے سنا", "confidence": 97.0}, '
+    '"arabic": {"text": "اس سا", "confidence": 50.0}}}';
+const _unread = '{"bbox": [900, 300, 1200, 400], "column": 1, "text": "", '
+    '"language": "unknown", "engine": "", "confidence": 0.0, "candidates": {}}';
+
+String _page(String cells) => '''
 {
-  "request_id": "5ea6799b487347379b1a173cdbefa52a",
-  "image": {"width": 1100, "height": 880},
-  "skew_angle": -3.3,
-  "layout_engine": "layoutparser-paddledetection",
-  "blocks": [
-    {
-      "id": 0, "type": "List", "bbox": [753, 393, 1026, 611], "language": "urdu",
-      "text": "• میرتقی میرکی شاعری",
-      "lines": [
-        {
-          "bbox": [761, 396, 1018, 480], "text": "میرتقی میرکی شاعری",
-          "language": "urdu", "engine": "UTRNet", "confidence": 94.84, "is_bullet": true,
-          "candidates": {
-            "urdu": {"text": "‘میرتقی میرکی شاعری", "confidence": 94.84},
-            "arabic": {"text": "هيرتى مري شاعرى", "confidence": 66.1}
-          }
-        }
-      ]
-    }
-  ],
-  "formatted_text": "• میرتقی میرکی شاعری",
-  "processing_ms": 41347
-}
-''';
+  "request_id": "abc", "image": {"width": 1788, "height": 2819},
+  "rotation": 0, "skew_angle": -4.4, "layout_engine": "layoutparser-paddledetection",
+  "blocks": [{"id": 0, "type": "Table", "bbox": [900, 300, 1500, 400], "columns": 2,
+              "language": "urdu", "text": "",
+              "rows": [{"bbox": [900, 300, 1500, 400], "is_bullet": false, "text": "",
+                        "cells": [$cells]}]}],
+  "formatted_text": "", "processing_ms": 0, "total_cells": 2
+}''';
 
 void main() {
-  test('OcrResult.fromJson parses a real backend response', () {
-    final result = OcrResult.fromJson(jsonDecode(_sampleResponse) as Map<String, dynamic>);
+  test('Table rows join columns with TAB in right-to-left column order', () {
+    final r = OcrResult.fromJson(jsonDecode(_page('$_cell1, $_cell2')) as Map<String, dynamic>);
+    final block = r.blocks.single;
+    expect(block.isTable, isTrue);
+    expect(block.columns, 2);
+    expect(r.currentText(), 'سَمِعَ\tاس نے سنا');
+    expect(r.readCells, 2);
+  });
 
-    expect(result.imageWidth, 1100);
-    expect(result.imageHeight, 880);
-    expect(result.skewAngle, closeTo(-3.3, 1e-9));
-    expect(result.processingMs, 41347);
-    expect(result.blocks, hasLength(1));
+  test('Streaming: a cell event fills in an unread cell', () {
+    final r = OcrResult.fromJson(jsonDecode(_page('$_cell1, $_unread')) as Map<String, dynamic>);
+    expect(r.readCells, 1);
+    expect(r.totalCells, 2);
 
-    final block = result.blocks.single;
-    expect(block.type, 'List');
-    expect(block.bbox.x2, 1026);
+    // Same shape as {"event": "cell", "block": 0, "row": 0, "cell": 1, ...cell}
+    final event = jsonDecode('{"event": "cell", "block": 0, "row": 0, "cell": 1, '
+        '${_cell2.substring(1)}') as Map<String, dynamic>;
+    r.blocks[event['block'] as int].rows[event['row'] as int].cells[event['cell'] as int] =
+        OcrCell.fromJson(event);
 
-    final line = block.lines.single;
-    expect(line.text, 'میرتقی میرکی شاعری');
-    expect(line.engine, 'UTRNet');
-    expect(line.language, 'urdu');
-    expect(line.candidates['arabic']!.confidence, closeTo(66.1, 1e-9));
+    expect(r.readCells, 2);
+    expect(r.blocks.single.rows.single.cells[1].candidates['arabic']!.confidence, 50.0);
   });
 
   test('ApiService strips a trailing slash from the base URL', () {

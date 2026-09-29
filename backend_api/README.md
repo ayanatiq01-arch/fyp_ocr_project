@@ -2,11 +2,23 @@
 
 | File | Purpose |
 |---|---|
-| `main.py` | FastAPI app: `POST /api/v1/ocr`, `GET /health` |
-| `ocr_pipeline.py` | Layout → lines → UTRNet ‖ PaddleOCR → **confidence router** |
-| `image_processing.py` | OpenCV: 90°/180°/270° page orientation, deskew, shadow removal, adaptive binarisation, denoise, paragraph/line segmentation |
+| `main.py` | FastAPI app: `POST /api/v1/ocr/stream` (live NDJSON), `POST /api/v1/ocr`, `GET /health` |
+| `ocr_pipeline.py` | Auto-crop (text detection) → rows/blocks/tables → UTRNet ‖ PaddleOCR → **confidence router** |
+| `image_processing.py` | OpenCV: 90°/180°/270° page orientation, deskew, shadow removal, adaptive binarisation, denoise, line segmentation |
 | `UTRNet-High-Resolution-Urdu-Text-Recognition/` | Cloned UTRNet repo + `saved_models/UTRNet-Large/best_norm_ED.pth` |
 | `temp_uploads/` | Uploads are stored here while they are processed, then deleted (`KEEP_UPLOADS=1` keeps them) |
+
+## How a page is processed
+
+1. **Orientation and cleaning.** The page is turned upright (0/90/180/270°) and straightened by up to ±15°. Shadows are removed, and the page is denoised and binarised.
+2. **Auto-crop.** PaddleOCR's text detector (`PP-OCRv5_mobile_det`) finds every text line and table cell, so the user photographs the whole page and never crops by hand. Any ink the detector misses is picked up by an OpenCV fallback.
+3. **Layout.**
+   - Boxes are chained into rows, each box to its nearest neighbour on the left. This keeps rows intact on curved pages.
+   - Rows are grouped into blocks wherever the vertical gap is less than 0.8 line heights.
+   - A block becomes a **Table** when most of its rows have column-sized gaps. Columns are found from the right-aligned edges.
+   - A lone centred line becomes a **Title**. LayoutParser adds Title and List hints in the background.
+4. **Routing.** Every box goes to **UTRNet** and **PaddleOCR** at the same time. The higher confidence wins; the other result is discarded.
+5. **Output.** Results are streamed in reading order as they are ready. At the end, page ornaments are removed and bullets are marked. The formatted text keeps the page structure: a blank line between blocks, TAB between table columns, and `• ` for bullets.
 
 ## Setup (Windows, Python 3.11)
 
@@ -14,9 +26,10 @@
 setup_backend.bat
 ```
 
-The first start downloads two models, about 250 MB in total:
-- `arabic_PP-OCRv5_mobile_rec` goes to `%USERPROFILE%\.paddlex\official_models\`.
-- LayoutParser PubLayNet goes to `%USERPROFILE%\.torch\iopath_cache\`.
+The first start downloads these models to `%USERPROFILE%\.paddlex\official_models\` and `%USERPROFILE%\.torch\iopath_cache\`:
+- `arabic_PP-OCRv5_mobile_rec` (PaddleOCR recognition)
+- `PP-OCRv5_mobile_det` (PaddleOCR text detection)
+- LayoutParser PubLayNet
 
 ## Run
 
@@ -25,36 +38,32 @@ venv\Scripts\python main.py
 ```
 
 - API docs: http://localhost:8000/docs
-- A phone on the same Wi-Fi uses `http://<PC-LAN-IP>:8000`. Allow Python through Windows Firewall when Windows asks.
+- A phone on the same Wi-Fi uses `http://<PC-LAN-IP>:8000`. If the phone can't connect, allow TCP port 8000 for the local network in Windows Firewall.
 
 ```bash
-curl -F "file=@page.jpg" http://localhost:8000/api/v1/ocr
+curl -F "file=@page.jpg" http://localhost:8000/api/v1/ocr            # final JSON
+curl -N -F "file=@page.jpg" http://localhost:8000/api/v1/ocr/stream  # live events
 ```
 
 ## Response (abridged)
 
 ```json
 {
-  "request_id": "5ea6…",
-  "image": {"width": 1100, "height": 880},
-  "skew_angle": -3.3,
-  "layout_engine": "layoutparser-paddledetection",
-  "blocks": [{
-    "id": 0, "type": "List", "bbox": [753, 393, 1026, 611], "language": "urdu",
-    "text": "• میرتقی میرکی شاعری\n• مرزا غالب کے خطوط",
-    "lines": [{
-      "bbox": [761, 396, 1018, 480], "text": "میرتقی میرکی شاعری",
-      "language": "urdu", "engine": "UTRNet", "confidence": 94.84, "is_bullet": true,
-      "candidates": {"urdu": {"text": "…", "confidence": 94.84},
-                     "arabic": {"text": "…", "confidence": 66.1}}
-    }]
-  }],
-  "formatted_text": "…paragraphs separated by blank lines, bullets as •…",
-  "processing_ms": 41347
+  "image": {"width": 1788, "height": 2819}, "rotation": 0, "skew_angle": -4.4,
+  "blocks": [
+    {"id": 0, "type": "Title", "columns": 1, "text": "سبق نمبر۸کے الفاظ کےمعانی", "rows": [...]},
+    {"id": 1, "type": "Table", "columns": 4,
+     "rows": [{"text": "سَمعَ\tاس نے سنا\tشَگَرَ\tاس نے شکرکیا",
+               "cells": [{"bbox": [1449, 391, 1648, 505], "column": 0, "text": "سَمعَ",
+                          "language": "urdu", "engine": "UTRNet", "confidence": 99.5,
+                          "candidates": {"urdu": {...}, "arabic": {...}}}, ...]}]}
+  ],
+  "formatted_text": "…",
+  "processing_ms": 80269
 }
 ```
 
-All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image. Deskewing is undone before the boxes are returned.
+The stream sends a `layout` event first (all boxes, no text), then one `cell` event per box in reading order, then `done` with the object above. All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image.
 
 ## Configuration (environment variables)
 
@@ -62,16 +71,21 @@ All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image. Deskewing 
 |---|---|---|
 | `OCR_DEVICE` | `cpu` | `gpu` requires the CUDA builds of PyTorch and PaddlePaddle |
 | `ROUTER_URDU_MARGIN` | `0.0` | Calibration offset subtracted from UTRNet's score in the router. Tune it on labelled pages. |
+| `MIN_TEXT_CONFIDENCE` | `0.5` | Boxes that neither engine reads above this are dropped as ornaments or noise |
 | `TORCH_THREADS` / `OCR_CPU_THREADS` | all cores / half | CPU threads for UTRNet / Paddle |
-| `PADDLE_ARABIC_MODEL` | `arabic_PP-OCRv5_mobile_rec` | Any PaddleOCR 3.x recognition model name |
-| `LAYOUT_SCORE_THRESHOLD` | `0.5` | LayoutParser detection threshold |
+| `PADDLE_ARABIC_MODEL` / `PADDLE_DET_MODEL` | `arabic_PP-OCRv5_mobile_rec` / `PP-OCRv5_mobile_det` | PaddleOCR 3.x model names |
 | `MAX_UPLOAD_MB` | `20` | Upload size limit |
 | `KEEP_UPLOADS` | `0` | `1` keeps files in `temp_uploads/` |
 
 ## Known limitations (measured, not guessed)
 
-- **Speed:** on a dual-core i5 (CPU only), UTRNet's HRNet backbone takes about 3 s per text line. A page with 8 lines takes about 35–40 s. A CUDA GPU (`OCR_DEVICE=gpu`) removes this bottleneck.
-- **LayoutParser model:** the PubLayNet model was trained on English research papers. On Urdu/Arabic pages it usually returns nothing, or a single "Figure". `detect_paragraphs()` in `image_processing.py` (lines first, then paragraph grouping by vertical gap) covers that case, and it also splits any large model block into its paragraphs.
-- **Router bias:** UTRNet is often *more* confident than PaddleOCR even on Arabic Naskh lines. On test pages it scored 96–99 % against PaddleOCR's 93–97 %. With the default margin of 0 those lines are labelled `urdu`, although the text itself is read correctly apart from ی/ي. On Urdu lines PaddleOCR trails by 20 points or more. So a margin of about 0.05–0.10 fixed the Arabic labels on the test pages. Validate it on real scans before relying on it.
-- **Line width:** UTRNet squeezes each line to 32×400 px, as in its `read.py`. Very long lines lose some resolution.
-- **License:** UTRNet code and models are CC BY-NC-SA 4.0, for non-commercial and academic use only.
+- **Speed (CPU only).** On a dual-core i5 laptop with 8 GB RAM, a dictionary page with 58 boxes gives:
+  - layout after about 17 s
+  - first text after about 22 s
+  - the whole page after about 80 s
+
+  UTRNet's HRNet backbone takes about 0.5–1 s per box. Each box is run at its own width (padded to a multiple of 16) instead of the fixed 400 px, which is about 4× faster than in `read.py`. Close other heavy programs, since the models need about 2 GB of RAM. A CUDA GPU (`OCR_DEVICE=gpu`) removes the bottleneck.
+- **Router on Arabic words.** On the test book, UTRNet was *more* confident than PaddleOCR even on Arabic words with harakat. For example, خَلَدَ scored 99.5 % vs 79 %. The text is read correctly, but those words are labelled `urdu`. With the default margin of 0 this follows the specified rule exactly.
+- **LayoutParser.** The only available Paddle model (PubLayNet) was trained on English research papers and usually finds nothing on Urdu/Arabic pages. So page structure comes from the detected text boxes, and LayoutParser only adds Title/List hints.
+- **Multi-column prose.** Two side-by-side columns of running text are treated as a two-column table. The text is correct, but reading order goes row by row across both columns.
+- **License.** UTRNet code and models are CC BY-NC-SA 4.0, for non-commercial and academic use only.

@@ -3,9 +3,16 @@ main.py - FastAPI server for the Bilingual (Urdu & Arabic) OCR Scanner.
 
 Endpoints
 ---------
-GET  /health        -> liveness + which models are loaded
-POST /api/v1/ocr    -> multipart/form-data with field "file" (the cropped image)
-                       returns text, language and bounding boxes as JSON
+GET  /health             -> liveness + which models are loaded
+POST /api/v1/ocr         -> multipart/form-data, field "file" (whole page photo).
+                            Returns the finished page as one JSON object.
+POST /api/v1/ocr/stream  -> same input; streams NDJSON (one JSON object per
+                            line) so the app can show text while the rest of
+                            the page is still being read:
+                              {"event": "layout", ...page structure, no text}
+                              {"event": "cell", "block": b, "row": r, "cell": c, ...}
+                              {"event": "done", ...final page (= /api/v1/ocr)}
+                              {"event": "error", "detail": "..."}
 
 Run
 ---
@@ -17,19 +24,22 @@ Interactive docs: http://localhost:8000/docs
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 import image_processing as ip
-from ocr_pipeline import OcrPipeline, PipelineResult
+from ocr_pipeline import Cell, OcrPipeline, PipelineResult
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -37,7 +47,7 @@ from ocr_pipeline import OcrPipeline, PipelineResult
 BACKEND_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BACKEND_DIR / "temp_uploads"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".heic", ".heif"}
 # Keep uploaded images after processing (useful for collecting test data).
 KEEP_UPLOADS = os.getenv("KEEP_UPLOADS", "0") == "1"
 
@@ -56,24 +66,32 @@ class Candidate(BaseModel):
     confidence: float = Field(..., description="0-100")
 
 
-class Line(BaseModel):
+class CellOut(BaseModel):
     bbox: List[int] = Field(..., description="[x1, y1, x2, y2] in uploaded-image pixels")
+    column: int = Field(..., description="Table column, 0 = right-most")
     text: str
     language: str = Field(..., description="urdu | arabic | unknown")
-    engine: str = Field(..., description="UTRNet | PaddleOCR")
+    engine: str = Field(..., description="UTRNet | PaddleOCR (empty until read)")
     confidence: float = Field(..., description="0-100, of the accepted engine")
-    is_bullet: bool
     candidates: Dict[str, Candidate] = Field(
-        ..., description="Both engines' raw results, keyed by language")
+        default_factory=dict, description="Both engines' raw results, keyed by language")
+
+
+class RowOut(BaseModel):
+    bbox: List[int]
+    is_bullet: bool
+    text: str
+    cells: List[CellOut] = Field(..., description="Right-to-left reading order")
 
 
 class BlockOut(BaseModel):
     id: int
-    type: str = Field(..., description="Text | Title | List")
+    type: str = Field(..., description="Text | Title | List | Table")
     bbox: List[int]
+    columns: int = Field(..., description="Number of table columns (1 for text)")
     language: str = Field(..., description="urdu | arabic | mixed | unknown")
     text: str
-    lines: List[Line]
+    rows: List[RowOut]
 
 
 class ImageInfo(BaseModel):
@@ -89,7 +107,8 @@ class OcrResponse(BaseModel):
     skew_angle: float = Field(..., description="Degrees the page was rotated to deskew it")
     layout_engine: str
     blocks: List[BlockOut]
-    formatted_text: str = Field(..., description="Text with paragraphs and bullets preserved")
+    formatted_text: str = Field(..., description="Page text: blank line between blocks, "
+                                                 "TAB between table columns, '• ' bullets")
     processing_ms: int
 
 
@@ -97,29 +116,32 @@ def _pct(x: float) -> float:
     return round(100.0 * x, 2)
 
 
+def cell_out(pre: ip.PreprocessResult, cell: Cell) -> CellOut:
+    return CellOut(
+        bbox=list(pre.to_original(cell.box)),
+        column=cell.column,
+        text=cell.text,
+        language=cell.language,
+        engine=cell.engine,
+        confidence=_pct(cell.confidence),
+        candidates={lang: Candidate(text=c.text, confidence=_pct(c.confidence))
+                    for lang, c in cell.candidates.items()},
+    )
+
+
 def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
     """Convert pipeline output to the API schema, mapping every box back to
     the coordinate system of the image the client uploaded."""
     pre = result.pre
-    blocks_out: List[BlockOut] = []
+    blocks_out = []
     for idx, block in enumerate(result.blocks):
-        lines = [
-            Line(
-                bbox=list(pre.to_original(l.box)),
-                text=l.text,
-                language=l.language,
-                engine=l.engine,
-                confidence=_pct(l.confidence),
-                is_bullet=l.is_bullet,
-                candidates={lang: Candidate(text=c.text, confidence=_pct(c.confidence))
-                            for lang, c in l.candidates.items()},
-            )
-            for l in block.lines
-        ]
+        rows = [RowOut(bbox=list(pre.to_original(row.box)), is_bullet=row.is_bullet,
+                       text=row.text(table=block.type == "Table", columns=block.columns),
+                       cells=[cell_out(pre, c) for c in row.cells])
+                for row in block.rows]
         blocks_out.append(BlockOut(
             id=idx, type=block.type, bbox=list(pre.to_original(block.box)),
-            language=block.language, text=block.text(), lines=lines))
-
+            columns=block.columns, language=block.language, text=block.text(), rows=rows))
     width, height = pre.original_size
     return OcrResponse(
         request_id=request_id,
@@ -138,7 +160,7 @@ def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load all models once at start-up (takes ~30 s; first run also
+    """Load all models once at start-up (~40 s; the first run also
     downloads the PaddleOCR and LayoutParser models)."""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("Loading OCR models ...")
@@ -149,10 +171,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Bilingual Urdu & Arabic OCR API",
-    version="1.0.0",
+    version="2.0.0",
     description="Digitises photos of historical books with mixed Urdu (Nastaliq) "
-                "and Arabic (Naskh) text using confidence-score routing between "
-                "UTRNet and PaddleOCR.",
+                "and Arabic (Naskh) text: automatic text detection, UTRNet / PaddleOCR "
+                "confidence-score routing, and page-layout reconstruction.",
     lifespan=lifespan,
 )
 
@@ -172,50 +194,102 @@ def health(request: Request) -> dict:
         "models": {
             "urdu": "UTRNet-Large (HRNet-DBiLSTM-CTC)",
             "arabic": pipeline.arabic.model_name,
+            "detection": "PP-OCRv5_mobile_det",
             "layout": pipeline.layout.engine,
         },
     }
 
 
-# Plain `def` (not async): OCR is CPU-bound, so FastAPI runs it in its
-# thread pool and the event loop stays responsive for other requests.
-@app.post("/api/v1/ocr", response_model=OcrResponse)
-def ocr(request: Request, file: UploadFile = File(..., description="Cropped page image")
-        ) -> OcrResponse:
-    request_id = uuid.uuid4().hex
-    ext = Path(file.filename or "").suffix.lower() or ".jpg"
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(415, f"Unsupported file type '{ext}'. "
-                                 f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
+def _read_upload(file: UploadFile) -> tuple[str, Path, np.ndarray]:
+    """Validate the upload, store it in temp_uploads/ and decode it.
 
+    The file name / extension is NOT trusted (phone apps send camera files
+    with various or missing extensions); the content itself is decoded and a
+    non-image is rejected with 400.
+    """
+    request_id = uuid.uuid4().hex
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        ext = ".img"  # only used for the temp file name
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"Image larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
     if not data:
         raise HTTPException(400, "Empty file")
 
-    # Store the upload in temp_uploads/ while it is being processed.
     temp_path = UPLOAD_DIR / f"{request_id}{ext}"
     temp_path.write_bytes(data)
     try:
-        try:
-            image = ip.decode_image(data)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        image = ip.decode_image(data)
+    except ValueError as exc:
+        _cleanup(temp_path)
+        raise HTTPException(400, str(exc)) from exc
+    return request_id, temp_path, image
 
+
+def _cleanup(path: Path) -> None:
+    if not KEEP_UPLOADS:
+        path.unlink(missing_ok=True)
+
+
+# Plain `def` (not async): OCR is CPU-bound, so FastAPI runs it in its
+# thread pool and the event loop stays responsive for other requests.
+@app.post("/api/v1/ocr", response_model=OcrResponse)
+def ocr(request: Request, file: UploadFile = File(..., description="Whole page photo")
+        ) -> OcrResponse:
+    request_id, temp_path, image = _read_upload(file)
+    try:
         result = request.app.state.pipeline.process(image)
         response = to_response(request_id, result)
         logger.info("request %s: %d blocks, %d ms", request_id, len(response.blocks),
                     response.processing_ms)
         return response
-    except HTTPException:
-        raise
     except Exception as exc:
         logger.exception("request %s failed", request_id)
         raise HTTPException(500, "OCR processing failed. See server log for details.") from exc
     finally:
-        if not KEEP_UPLOADS:
-            temp_path.unlink(missing_ok=True)
+        _cleanup(temp_path)
+
+
+@app.post("/api/v1/ocr/stream")
+def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole page photo")
+               ) -> StreamingResponse:
+    request_id, temp_path, image = _read_upload(file)
+    pipeline: OcrPipeline = request.app.state.pipeline
+
+    def events() -> Iterator[bytes]:
+        """NDJSON: one compact JSON object per line (UTF-8, Urdu kept as-is)."""
+        def line(obj: dict) -> bytes:
+            return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+        try:
+            pre = None
+            for event, payload in pipeline.process_iter(image):
+                if event == "layout":
+                    pre = payload.pre
+                    body = to_response(request_id, payload).model_dump()
+                    body["total_cells"] = sum(len(r.cells) for b in payload.blocks for r in b.rows)
+                    yield line({"event": "layout", **body})
+                elif event == "cell":
+                    bi, ri, ci, cell = payload
+                    yield line({"event": "cell", "block": bi, "row": ri, "cell": ci,
+                                **cell_out(pre, cell).model_dump()})
+                elif event == "done":
+                    body = to_response(request_id, payload).model_dump()
+                    logger.info("stream %s: %d blocks, %d ms", request_id,
+                                len(body["blocks"]), body["processing_ms"])
+                    yield line({"event": "done", **body})
+        except Exception:
+            logger.exception("stream %s failed", request_id)
+            yield line({"event": "error",
+                        "detail": "OCR processing failed. See server log for details."})
+        finally:
+            _cleanup(temp_path)
+
+    # Starlette iterates a sync generator in its thread pool, so the CPU-bound
+    # OCR does not block the event loop.
+    return StreamingResponse(events(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 if __name__ == "__main__":
