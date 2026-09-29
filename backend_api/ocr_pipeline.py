@@ -60,10 +60,31 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from dotenv import load_dotenv
 
 import image_processing as ip
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Step 2 of the hybrid Arabic OCR: LLM post-correction (OpenAI)
+# --------------------------------------------------------------------------- #
+# True  -> Arabic text read by PaddleOCR is corrected by OpenAI before output.
+# False -> Step 2 is skipped; the raw PaddleOCR text is returned.
+USE_LLM_CORRECTION = True
+
+LLM_MODEL = "gpt-4o-mini"
+LLM_SYSTEM_PROMPT = (
+    "You are an expert Arabic OCR corrector specializing in Quranic text and classical "
+    "Arabic. You will receive raw text extracted by an OCR engine from an old printed "
+    "book. The text may have: missing diacritics (harakat), broken words, misread "
+    "letters, missing Ayah markers, and extra noise characters. Your job is: 1) Fix all "
+    "spelling and diacritic errors. 2) Reconstruct broken words. 3) Remove "
+    "garbage/noise characters. 4) Do NOT add any new sentences or translate anything. "
+    "5) Return only the corrected Arabic text, nothing else."
+)
+# The API key is read from backend_api/.env (OPENAI_API_KEY=...), never from code.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # --------------------------------------------------------------------------- #
 # Paths / configuration (override with environment variables if needed)
@@ -120,6 +141,7 @@ class Cell:
     confidence: float = 0.0                # of the accepted engine, 0-1
     candidates: Dict[str, EngineResult] = field(default_factory=dict)
     done: bool = False
+    llm_corrected: bool = False            # text was corrected by OpenAI (Step 2)
 
 
 @dataclass
@@ -296,6 +318,64 @@ class PaddleArabicRecognizer:
             conf = float(out["rec_score"]) if text else 0.0
             results.append(EngineResult(self.name, self.language, text, conf))
         return results
+
+
+# --------------------------------------------------------------------------- #
+# Step 2: OpenAI post-correction of PaddleOCR's raw Arabic text
+# --------------------------------------------------------------------------- #
+class ArabicLLMCorrector:
+    """Sends raw PaddleOCR Arabic text to OpenAI (``LLM_MODEL``) with
+    ``LLM_SYSTEM_PROMPT`` and returns the corrected text.
+
+    Never raises: if Step 2 is switched off, no API key is configured, or the
+    API call fails for any reason (network, quota, timeout, invalid key),
+    the raw PaddleOCR text is returned unchanged.
+    """
+
+    def __init__(self):
+        self.client = None
+        if not USE_LLM_CORRECTION:
+            logger.info("LLM correction: OFF (USE_LLM_CORRECTION = False)")
+            return
+        if not os.getenv("OPENAI_API_KEY"):
+            logger.warning("LLM correction: OFF - OPENAI_API_KEY not found in backend_api/.env")
+            return
+        try:
+            from openai import OpenAI
+            # The client reads OPENAI_API_KEY from the environment itself.
+            self.client = OpenAI(timeout=20.0, max_retries=1)
+            logger.info("LLM correction: ON (%s)", LLM_MODEL)
+        except Exception:
+            logger.exception("LLM correction: OFF - could not create the OpenAI client")
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None
+
+    def correct(self, raw_text: str) -> Tuple[str, bool]:
+        """Return (text, corrected). ``corrected`` is False when the raw
+        PaddleOCR text is returned (Step 2 off, empty input or API failure)."""
+        if self.client is None or not raw_text.strip():
+            return raw_text, False
+        try:
+            logger.info("OpenAI API call (%s): %d chars", LLM_MODEL, len(raw_text))
+            response = self.client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=0,
+                messages=[{"role": "system", "content": LLM_SYSTEM_PROMPT},
+                          {"role": "user", "content": raw_text}],
+            )
+            text = (response.choices[0].message.content or "").strip()
+        except Exception as exc:  # network error, quota exceeded, timeout, bad key ...
+            logger.warning("OpenAI correction failed (%s: %s) - using raw PaddleOCR text",
+                           type(exc).__name__, exc)
+            return raw_text, False
+        # Safety net: an answer with no Arabic letters, or far longer than the
+        # OCR line, is not a correction of it (the prompt forbids new text).
+        if not _ARABIC_SCRIPT_RE.search(text) or len(text) > 2 * len(raw_text) + 20:
+            logger.warning("OpenAI answer rejected (not a plausible correction) - using raw text")
+            return raw_text, False
+        return text, True
 
 
 # --------------------------------------------------------------------------- #
@@ -997,6 +1077,9 @@ class OcrPipeline:
         self.arabic = PaddleArabicRecognizer(device="gpu:0" if use_gpu else "cpu")
         self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
+        self.corrector = ArabicLLMCorrector()
+        # API calls are network-bound: a few run in parallel per chunk.
+        self._llm_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm")
         # Two workers: one per engine, so both read the same boxes concurrently.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
         # LayoutParser runs in the background on its own worker.
@@ -1020,6 +1103,7 @@ class OcrPipeline:
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._layout_executor.shutdown(wait=False, cancel_futures=True)
+        self._llm_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ API
     def process(self, image_bgr: np.ndarray) -> PipelineResult:
@@ -1077,6 +1161,19 @@ class OcrPipeline:
                 cell.confidence = accepted.confidence
                 cell.candidates = {LANG_URDU: u, LANG_ARABIC: a}
                 cell.done = True
+
+            # Step 2: OpenAI corrects the raw PaddleOCR text of every box the
+            # router accepted as Arabic. Boxes won by UTRNet are not sent:
+            # their PaddleOCR text is discarded, so correcting it would only
+            # cost time and money. Routing used the raw confidences above.
+            if self.corrector.enabled:
+                arabic_cells = [item[3] for item in chunk if item[3].engine == PaddleArabicRecognizer.name]
+                fixes = list(self._llm_executor.map(self.corrector.correct,
+                                                    [c.text for c in arabic_cells]))
+                for c, (text, corrected) in zip(arabic_cells, fixes):
+                    c.text, c.llm_corrected = text, corrected
+
+            for bi, ri, ci, cell in chunk:
                 yield "cell", (bi, ri, ci, cell)
 
         apply_layout_hints(result.blocks, fut_hints.result())

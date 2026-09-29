@@ -65,6 +65,15 @@ curl -N -F "file=@page.jpg" http://localhost:8000/api/v1/ocr/stream  # live even
 
 The stream sends a `layout` event first (all boxes, no text), then one `cell` event per box in reading order, then `done` with the object above. All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image.
 
+## Arabic post-correction with OpenAI (optional, Step 2)
+
+Arabic text that the router accepted from PaddleOCR is sent to OpenAI `gpt-4o-mini`. The system prompt is in `LLM_SYSTEM_PROMPT` in `ocr_pipeline.py`. The corrected text replaces the raw text, and `candidates` in the JSON keep the raw OCR. Cells that were corrected have `"llm_corrected": true`.
+
+- **Switch it off:** set `USE_LLM_CORRECTION = False` at the top of `ocr_pipeline.py`.
+- **API key:** put it in `backend_api/.env` (see `.env.example`), as `OPENAI_API_KEY=sk-...`. The file is git-ignored.
+- **Failures:** with no key, a network error, exhausted quota or an invalid key, the raw PaddleOCR text is used. The server never crashes. Every API call and every failure is logged in the server output.
+- **Boxes won by UTRNet are not sent.** Their PaddleOCR text is discarded by the router, so correcting it would only cost time and money.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |

@@ -21,3 +21,6 @@ backend_api/UTRNet-High-Resolution-Urdu-Text-Recognition/read_outputs/
 Thumbs.db
 .vscode/
 backend_api/server.log
+
+# ---- Secrets ----
+backend_api/.env
