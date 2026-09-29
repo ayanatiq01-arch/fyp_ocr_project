@@ -12,6 +12,9 @@ dependencies:
     sdk: flutter
   # Native camera / gallery access.
   image_picker: ^1.2.3
+  # Google ML Kit document scanner (Android): edge detection, perspective
+  # correction, shadow / stain removal - gives the OCR a flat, clean page.
+  google_mlkit_document_scanner: ^0.6.1
   # Interactive cropping UI (uCrop on Android, TOCropViewController on iOS).
   image_cropper: ^12.2.1
   # Multipart HTTP upload to the FastAPI backend.

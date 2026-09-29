@@ -1,6 +1,12 @@
 # frontend_app — Flutter client
 
-Camera → interactive crop → upload to the FastAPI backend → RTL text + layout boxes.
+Document scanner (or camera) → upload the whole page to the FastAPI backend → RTL text + layout boxes.
+
+**Scan page (best quality)** opens Google's ML Kit Document Scanner (`google_mlkit_document_scanner`).
+
+- **What it does:** it detects the page edges, flattens the perspective and removes shadows and stains before the page is sent for OCR.
+- **Requirements:** Android only. It needs Google Play services and no camera permission.
+- **Fallback:** on iOS, or if the scanner is unavailable, the app uses the plain camera.
 
 | File | Purpose |
 |---|---|

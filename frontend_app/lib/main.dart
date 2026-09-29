@@ -2,7 +2,8 @@
 //
 // Bilingual (Urdu & Arabic) OCR Scanner - Flutter UI.
 //
-// Flow:  Camera / Gallery  ->  upload the WHOLE page (no manual cropping;
+// Flow:  Scan (Google ML Kit document scanner: edges, perspective, shadow
+//        clean-up) or Camera / Gallery  ->  upload the WHOLE page (no manual cropping;
 //        the backend finds every text box itself)  ->  text streams in, in
 //        reading order  ->  page is shown with its original structure
 //        (title, paragraphs, bullets, tables).
@@ -13,6 +14,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'api_service.dart';
@@ -85,6 +87,39 @@ class _ScannerPageState extends State<ScannerPage> {
     final LostDataResponse lost = await _picker.retrieveLostData();
     if (lost.isEmpty || lost.file == null || !mounted) return;
     _startScan(File(lost.file!.path));
+  }
+
+  /// Best capture path: Google's ML Kit document scanner (Android only).
+  ///
+  /// It finds the page edges, flattens the perspective, removes shadows and
+  /// stains, and hands back a clean page image - exactly what the OCR needs.
+  /// Falls back to the plain camera when it is unavailable (iOS, or Google
+  /// Play services missing / outdated).
+  Future<void> _scanWithDocumentScanner() async {
+    if (!Platform.isAndroid) {
+      _snack('Document scanner is only available on Android - using the camera.');
+      return _pick(ImageSource.camera);
+    }
+    final scanner = DocumentScanner(
+      options: DocumentScannerOptions(
+        documentFormats: const {DocumentFormat.jpeg},
+        mode: ScannerMode.full, // crop + filters + shadow/stain clean-up
+        pageLimit: 1,
+        isGalleryImport: true, // also lets the user pick an existing photo
+      ),
+    );
+    try {
+      final DocumentScanningResult result = await scanner.scanDocument();
+      final images = result.images;
+      if (images == null || images.isEmpty) return;
+      _startScan(File(images.first));
+    } on PlatformException catch (e) {
+      if ((e.message ?? '').toLowerCase().contains('cancel')) return; // user backed out
+      _snack('Document scanner unavailable (${e.message}) - using the camera.');
+      await _pick(ImageSource.camera);
+    } finally {
+      await scanner.close();
+    }
   }
 
   Future<void> _pick(ImageSource source) async {
@@ -248,16 +283,23 @@ class _ScannerPageState extends State<ScannerPage> {
             Icon(Icons.menu_book, size: 96, color: Theme.of(context).colorScheme.primary),
             const SizedBox(height: 16),
             Text(
-              'Photograph a full book page.\nThe app finds and reads all the text by itself.',
+              'Scan a full book page.\nThe app finds and reads all the text by itself.',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 32),
             FilledButton.icon(
+              onPressed: _scanWithDocumentScanner,
+              icon: const Icon(Icons.document_scanner),
+              label: const Text('Scan page (best quality)'),
+              style: FilledButton.styleFrom(minimumSize: const Size(260, 56)),
+            ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
               onPressed: () => _pick(ImageSource.camera),
               icon: const Icon(Icons.photo_camera),
-              label: const Text('Take photo'),
-              style: FilledButton.styleFrom(minimumSize: const Size(220, 52)),
+              label: const Text('Take plain photo'),
+              style: OutlinedButton.styleFrom(minimumSize: const Size(220, 52)),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
