@@ -95,17 +95,29 @@ class _ScannerPageState extends State<ScannerPage> {
   /// stains, and hands back a clean page image - exactly what the OCR needs.
   /// Falls back to the plain camera when it is unavailable (iOS, or Google
   /// Play services missing / outdated).
-  Future<void> _scanWithDocumentScanner() async {
+  ///
+  /// Both entry points go through it:
+  ///  * camera  - the scanner opens its camera (auto-capture on the page);
+  ///  * gallery - the scanner opens with its gallery button enabled. ML Kit
+  ///    cannot be handed an existing file, so the photo is picked INSIDE the
+  ///    scanner (gallery icon), which then detects the page, flattens and
+  ///    cleans it exactly like a camera capture.
+  Future<void> _capture(ImageSource source) async {
+    final fromGallery = source == ImageSource.gallery;
     if (!Platform.isAndroid) {
-      _snack('Document scanner is only available on Android - using the camera.');
-      return _pick(ImageSource.camera);
+      _snack('Document scanner is only available on Android - using the plain '
+          '${fromGallery ? 'gallery' : 'camera'}.');
+      return _pick(source);
+    }
+    if (fromGallery) {
+      _snack('Tap the gallery icon in the scanner to choose your photo.');
     }
     final scanner = DocumentScanner(
       options: DocumentScannerOptions(
         documentFormats: const {DocumentFormat.jpeg},
         mode: ScannerMode.full, // crop + filters + shadow/stain clean-up
         pageLimit: 1,
-        isGalleryImport: true, // also lets the user pick an existing photo
+        isGalleryImport: fromGallery,
       ),
     );
     try {
@@ -115,8 +127,9 @@ class _ScannerPageState extends State<ScannerPage> {
       _startScan(File(images.first));
     } on PlatformException catch (e) {
       if ((e.message ?? '').toLowerCase().contains('cancel')) return; // user backed out
-      _snack('Document scanner unavailable (${e.message}) - using the camera.');
-      await _pick(ImageSource.camera);
+      _snack('Document scanner unavailable (${e.message}) - using the plain '
+          '${fromGallery ? 'gallery' : 'camera'}.');
+      await _pick(source);
     } finally {
       await scanner.close();
     }
@@ -289,24 +302,24 @@ class _ScannerPageState extends State<ScannerPage> {
             ),
             const SizedBox(height: 32),
             FilledButton.icon(
-              onPressed: _scanWithDocumentScanner,
-              icon: const Icon(Icons.document_scanner),
-              label: const Text('Scan page (best quality)'),
-              style: FilledButton.styleFrom(minimumSize: const Size(260, 56)),
-            ),
-            const SizedBox(height: 12),
-            OutlinedButton.icon(
-              onPressed: () => _pick(ImageSource.camera),
+              onPressed: () => _capture(ImageSource.camera),
               icon: const Icon(Icons.photo_camera),
-              label: const Text('Take plain photo'),
-              style: OutlinedButton.styleFrom(minimumSize: const Size(220, 52)),
+              label: const Text('Take photo'),
+              style: FilledButton.styleFrom(minimumSize: const Size(240, 56)),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: () => _pick(ImageSource.gallery),
+              onPressed: () => _capture(ImageSource.gallery),
               icon: const Icon(Icons.photo_library),
               label: const Text('Choose from gallery'),
-              style: OutlinedButton.styleFrom(minimumSize: const Size(220, 52)),
+              style: OutlinedButton.styleFrom(minimumSize: const Size(240, 56)),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Both go through the document scanner (page edges, straightening, '
+              'shadow removal) before the text is read.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
             ),
           ],
         ),

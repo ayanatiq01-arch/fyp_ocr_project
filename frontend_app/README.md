@@ -2,11 +2,11 @@
 
 Document scanner (or camera) → upload the whole page to the FastAPI backend → RTL text + layout boxes.
 
-**Scan page (best quality)** opens Google's ML Kit Document Scanner (`google_mlkit_document_scanner`).
+**Take photo** and **Choose from gallery** both go through Google's ML Kit Document Scanner (`google_mlkit_document_scanner`, Android, Google Play services). It detects the page edges, flattens the perspective and removes shadows and stains before the page is sent for OCR.
 
-- **What it does:** it detects the page edges, flattens the perspective and removes shadows and stains before the page is sent for OCR.
-- **Requirements:** Android only. It needs Google Play services and no camera permission.
-- **Fallback:** on iOS, or if the scanner is unavailable, the app uses the plain camera.
+- **Gallery photos:** ML Kit cannot be handed an existing file, so the photo is picked with the gallery icon inside the scanner.
+- **Fallback:** on iOS, or if the scanner is unavailable, the plain camera or gallery is used.
+- **Release builds:** they need the R8 keep rules in `android/app/proguard-rules.pro`. Without them the scanner crashes with a NullPointerException.
 
 | File | Purpose |
 |---|---|
