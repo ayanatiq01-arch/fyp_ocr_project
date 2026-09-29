@@ -60,35 +60,10 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
-from dotenv import load_dotenv
 
 import image_processing as ip
 
 logger = logging.getLogger(__name__)
-
-# --------------------------------------------------------------------------- #
-# Step 2 of the hybrid Arabic OCR: LLM post-correction (OpenAI)
-# --------------------------------------------------------------------------- #
-# True  -> Arabic OCR text is corrected by OpenAI before output.
-# False -> Step 2 is skipped; the raw OCR text is returned.
-USE_LLM_CORRECTION = True
-
-_LLM_MODEL = "gpt-6-luna"
-# gpt-6-luna reasons by default and then rejects `temperature`; with reasoning
-# off ("none") temperature 0 is accepted and gives repeatable corrections.
-_LLM_REASONING_EFFORT = "none"
-_LLM_SYSTEM_PROMPT = (
-    "You are an expert Arabic OCR corrector. Fix spelling errors, missing diacritics, "
-    "broken words, and remove noise characters from this OCR-extracted Arabic text. "
-    "Do NOT add new sentences. Return only the corrected Arabic text."
-)
-# Below this OCR confidence the box is not sent to the API (the OCR output is
-# too unreliable to correct - the model would invent text); it is marked
-# low_confidence instead.
-_LLM_MIN_OCR_CONFIDENCE = 0.4
-
-# The API key is read from backend_api/.env (OPENAI_API_KEY=...), never from code.
-load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # --------------------------------------------------------------------------- #
 # Paths / configuration (override with environment variables if needed)
@@ -116,25 +91,6 @@ ROUTER_URDU_MARGIN = float(os.getenv("ROUTER_URDU_MARGIN", "0.0"))
 # Results below this confidence (from BOTH engines) are treated as non-text
 # (page ornaments, stains, torn edges) and dropped from the final page.
 MIN_TEXT_CONFIDENCE = float(os.getenv("MIN_TEXT_CONFIDENCE", "0.5"))
-
-_HARAKAT_RE = re.compile(r"[ً-ْٰ]")          # tanween, fatha ... sukun, dagger alif
-_LETTER_RE = re.compile(r"[ء-غف-يٱ-ۓ]")
-_URDU_ONLY_RE = re.compile(r"[ٹڈڑںھےۓ]")  # ٹ ڈ ڑ ں ھ ے ۓ
-
-
-def looks_arabic(text: str) -> bool:
-    """Script-detection heuristic: is this recognised text Arabic?
-
-    Classical Arabic / Quranic print carries harakat on almost every word,
-    Urdu print rarely does, and Urdu-only letters (ٹ ڈ ڑ ں ھ ے ۓ) never occur
-    in Arabic. Arabic = no Urdu-only letter AND at least one haraka per five
-    letters. (30/30 correct on OCR output of the test pages; Arabic printed
-    WITHOUT harakat is not detected by this rule.)
-    """
-    letters = len(_LETTER_RE.findall(text))
-    return letters > 0 and not _URDU_ONLY_RE.search(text) and \
-        len(_HARAKAT_RE.findall(text)) / letters >= 0.2
-
 
 LANG_URDU = "urdu"
 LANG_ARABIC = "arabic"
@@ -164,7 +120,6 @@ class Cell:
     confidence: float = 0.0                # of the accepted engine, 0-1
     candidates: Dict[str, EngineResult] = field(default_factory=dict)
     done: bool = False
-    low_confidence: bool = False           # Arabic box too unreliable to correct
 
 
 @dataclass
@@ -341,62 +296,6 @@ class PaddleArabicRecognizer:
             conf = float(out["rec_score"]) if text else 0.0
             results.append(EngineResult(self.name, self.language, text, conf))
         return results
-
-
-# --------------------------------------------------------------------------- #
-# Step 2 (internal): OpenAI post-correction of the Arabic OCR text
-# --------------------------------------------------------------------------- #
-# Private to this module: main.py never calls it and the API response carries
-# no trace of it - callers only see the final Arabic text of each box.
-_openai_client = None
-_openai_client_lock = threading.Lock()
-
-
-def _get_openai_client():
-    """Create the OpenAI client once (None if Step 2 is off or no key)."""
-    global _openai_client
-    if not USE_LLM_CORRECTION or not os.getenv("OPENAI_API_KEY"):
-        return None
-    with _openai_client_lock:
-        if _openai_client is None:
-            try:
-                from openai import OpenAI
-                # The client reads OPENAI_API_KEY from the environment itself.
-                _openai_client = OpenAI(timeout=20.0, max_retries=1)
-            except Exception:
-                logger.debug("OpenAI client could not be created", exc_info=True)
-                return None
-    return _openai_client
-
-
-def _correct_arabic_text(raw_text: str) -> str:
-    """Return the corrected Arabic text, or ``raw_text`` unchanged.
-
-    Never raises. The raw text is returned silently when Step 2 is switched
-    off, no API key is configured, the call fails (network, quota, timeout,
-    invalid key) or the answer is not a plausible correction.
-    """
-    client = _get_openai_client()
-    if client is None or not raw_text.strip():
-        return raw_text
-    try:
-        response = client.chat.completions.create(
-            model=_LLM_MODEL,
-            reasoning_effort=_LLM_REASONING_EFFORT,
-            temperature=0,
-            messages=[{"role": "system", "content": _LLM_SYSTEM_PROMPT},
-                      {"role": "user", "content": raw_text}],
-        )
-        text = (response.choices[0].message.content or "").strip()
-    except Exception as exc:  # network error, quota exceeded, timeout, bad key ...
-        logger.debug("Arabic correction unavailable (%s) - raw OCR text kept", type(exc).__name__)
-        return raw_text
-    # An answer without Arabic letters, or far longer than the OCR line, is not
-    # a correction of it (the prompt forbids new sentences).
-    if not _ARABIC_SCRIPT_RE.search(text) or len(text) > 2 * len(raw_text) + 20:
-        return raw_text
-    logger.debug("Arabic correction: %r -> %r", raw_text, text)
-    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -1098,8 +997,6 @@ class OcrPipeline:
         self.arabic = PaddleArabicRecognizer(device="gpu:0" if use_gpu else "cpu")
         self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
-        # Step 2 calls are network-bound: a few run in parallel per chunk.
-        self._llm_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm")
         # Two workers: one per engine, so both read the same boxes concurrently.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
         # LayoutParser runs in the background on its own worker.
@@ -1123,7 +1020,6 @@ class OcrPipeline:
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._layout_executor.shutdown(wait=False, cancel_futures=True)
-        self._llm_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ API
     def process(self, image_bgr: np.ndarray) -> PipelineResult:
@@ -1181,31 +1077,6 @@ class OcrPipeline:
                 cell.confidence = accepted.confidence
                 cell.candidates = {LANG_URDU: u, LANG_ARABIC: a}
                 cell.done = True
-
-            # A box is Arabic if the router chose PaddleOCR (Arabic) OR the
-            # accepted text itself looks Arabic (script-detection heuristic).
-            # The second case fixes the label of Arabic lines that UTRNet won.
-            arabic_cells = [item[3] for item in chunk if item[3].text and (
-                item[3].engine == PaddleArabicRecognizer.name or looks_arabic(item[3].text))]
-            for c in arabic_cells:
-                c.language = LANG_ARABIC
-
-            # Step 2 (Arabic boxes only): the accepted OCR text goes through the
-            # internal OpenAI correction. A box whose OCR confidence is below
-            # 0.4 is not sent (the model would invent text) and is marked
-            # low_confidence instead.
-            to_correct = []
-            for c in arabic_cells:
-                if c.confidence < _LLM_MIN_OCR_CONFIDENCE:
-                    c.low_confidence = True
-                else:
-                    to_correct.append(c)
-            if to_correct and USE_LLM_CORRECTION:
-                for c, text in zip(to_correct, self._llm_executor.map(
-                        _correct_arabic_text, [c.text for c in to_correct])):
-                    c.text = text
-
-            for bi, ri, ci, cell in chunk:
                 yield "cell", (bi, ri, ci, cell)
 
         apply_layout_hints(result.blocks, fut_hints.result())

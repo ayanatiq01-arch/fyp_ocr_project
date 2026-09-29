@@ -15,10 +15,6 @@ paddlepaddle==3.3.1
 paddleocr==3.7.0
 paddlex==3.7.2
 
-# --- Arabic post-correction (Step 2, OpenAI) ---
-openai==3.20.0
-python-dotenv==1.2.3              # loads OPENAI_API_KEY from backend_api/.env
-
 # --- Layout analysis ---
 layoutparser==0.3.4
 
