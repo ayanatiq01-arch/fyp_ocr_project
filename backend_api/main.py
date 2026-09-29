@@ -84,6 +84,8 @@ class ImageInfo(BaseModel):
 class OcrResponse(BaseModel):
     request_id: str
     image: ImageInfo
+    rotation: int = Field(0, description="0/90/180/270: degrees (counter-clockwise) the "
+                                          "page was turned to make it upright")
     skew_angle: float = Field(..., description="Degrees the page was rotated to deskew it")
     layout_engine: str
     blocks: List[BlockOut]
@@ -122,6 +124,7 @@ def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
     return OcrResponse(
         request_id=request_id,
         image=ImageInfo(width=width, height=height),
+        rotation=result.rotation,
         skew_angle=pre.skew_angle,
         layout_engine=result.layout_engine,
         blocks=blocks_out,

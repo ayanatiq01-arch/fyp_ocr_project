@@ -509,6 +509,7 @@ class PipelineResult:
     blocks: List[Block]
     layout_engine: str
     processing_ms: int
+    rotation: int = 0            # degrees CCW applied to make the page upright
 
     def formatted_text(self) -> str:
         """Plain text that preserves the page structure:
@@ -539,7 +540,8 @@ class OcrPipeline:
     # ------------------------------------------------------------------ API
     def process(self, image_bgr: np.ndarray) -> PipelineResult:
         t0 = time.perf_counter()
-        pre = ip.preprocess(image_bgr)
+        turns = self._detect_orientation(image_bgr)
+        pre = ip.preprocess(image_bgr, quarter_turns=turns)
         blocks = self.layout.detect(pre.color, pre.binary)
 
         # 1. Segment every block into line images.
@@ -572,11 +574,52 @@ class OcrPipeline:
         blocks = [b for b in blocks if any(l.text for l in b.lines)]
 
         ms = int((time.perf_counter() - t0) * 1000)
-        logger.info("processed %d blocks / %d lines in %d ms", len(blocks), len(jobs), ms)
+        logger.info("processed %d blocks / %d lines in %d ms (rotated %d deg)",
+                    len(blocks), len(jobs), ms, turns * 90)
         return PipelineResult(pre=pre, blocks=blocks, layout_engine=self.layout.engine,
-                              processing_ms=ms)
+                              processing_ms=ms, rotation=turns * 90)
 
     # ------------------------------------------------------------ helpers
+    # Lines sampled per candidate orientation for the 0/180 decision.
+    ORIENTATION_SAMPLE_LINES = 5
+
+    def _detect_orientation(self, image_bgr: np.ndarray) -> int:
+        """Return how many CCW quarter turns make the page upright.
+
+        1. Projection profiles decide whether text lines currently run
+           horizontally (candidates 0 / 180 deg) or vertically (90 / 270).
+        2. The two remaining candidates differ by 180 deg, which profiles
+           cannot tell apart. Both are read with the fast PaddleOCR Arabic-
+           script recogniser on a few of the widest lines; upside-down
+           Arabic-script text gets a much lower confidence.
+        """
+        gray, binary = ip.quick_binary(image_bgr)
+        candidates = (1, 3) if ip.text_runs_vertically(binary) else (0, 2)
+
+        scores = {}
+        for k in candidates:
+            g, _ = ip.rotate90(gray, k)
+            b, _ = ip.rotate90(binary, k)
+            samples = []
+            for para in ip.detect_paragraphs(b):
+                para_bin = ip.crop(b, para)
+                for top, bottom in ip.segment_lines(para_bin):
+                    ink = ip.ink_bounds(para_bin[top:bottom])
+                    if ink is None:
+                        continue
+                    box = (para[0] + ink[0], para[1] + top, para[0] + ink[2], para[1] + bottom)
+                    if box[3] - box[1] >= 8:
+                        samples.append(ip.crop(g, box))
+            samples.sort(key=lambda s: s.shape[1], reverse=True)
+            samples = samples[:self.ORIENTATION_SAMPLE_LINES]
+            results = self.arabic.recognize_batch(samples) if samples else []
+            scores[k] = float(np.mean([r.confidence for r in results])) if results else 0.0
+
+        best = max(candidates, key=lambda k: scores[k])
+        logger.info("orientation: candidates=%s scores=%s -> rotate %d deg",
+                    [c * 90 for c in candidates],
+                    {c * 90: round(s, 3) for c, s in scores.items()}, best * 90)
+        return best
     def _lines_of(self, block: Block, pre: ip.PreprocessResult):
         """Yield (line_box, padded grayscale line image, has_bullet_glyph)."""
         bx1, by1, _, _ = block.box

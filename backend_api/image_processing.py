@@ -283,12 +283,89 @@ class PreprocessResult:
                 int(np.clip(ox2, 0, w)), int(np.clip(oy2, 0, h)))
 
 
+# --------------------------------------------------------------------------- #
+# Page orientation (0 / 90 / 180 / 270 degrees)
+# --------------------------------------------------------------------------- #
+def rotate90(image: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Rotate by ``k`` quarter turns counter-clockwise (like ``np.rot90``).
+
+    Returns:
+        (rotated_image, 2x3 affine mapping input -> output coordinates),
+        using pixel-edge coordinates so exclusive box edges map exactly.
+    """
+    k %= 4
+    h, w = image.shape[:2]
+    m = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64)
+    for _ in range(k):
+        # One CCW quarter turn of a (w x h) image: (x, y) -> (y, w - x).
+        step = np.array([[0, 1, 0], [-1, 0, w], [0, 0, 1]], dtype=np.float64)
+        m = step @ m
+        w, h = h, w
+    return np.ascontiguousarray(np.rot90(image, k)), m[:2]
+
+
+def quick_binary(image_bgr: np.ndarray, max_side: int = 1200
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Fast, low-resolution (gray, binary) pair for orientation checks.
+
+    Skips denoising (the slow step); good enough to find text lines.
+    """
+    scale = min(1.0, max_side / float(max(image_bgr.shape[:2])))
+    small = cv2.resize(image_bgr, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA) if scale < 1.0 else image_bgr
+    gray = remove_shadows(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
+    binary = remove_line_artifacts(cv2.medianBlur(adaptive_binarize(gray), 3))
+    return gray, binary
+
+
+def _line_band_score(ink: np.ndarray, max_skew: float = 15.0) -> float:
+    """How strongly the ink forms horizontal bands (text lines).
+
+    Coefficient of variation (std / mean) of the smoothed row profile:
+    horizontal text lines alternate full / empty rows (high value); text
+    running vertically spreads ink evenly over the rows (low value). The best
+    value over small tilts is used so a skewed photo is not penalised.
+    (Squared row-to-row differences do NOT work: the gaps between Nastaliq
+    words create many small jumps across columns too.)
+    """
+    h, w = ink.shape
+    best = 0.0
+    for angle in np.arange(-max_skew, max_skew + 1e-9, 3.0):
+        m = cv2.getRotationMatrix2D((w / 2, h / 2), float(angle), 1.0)
+        rotated = cv2.warpAffine(ink, m, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+        profile = np.convolve(rotated.sum(axis=1), np.ones(9) / 9, mode="same")
+        mean = profile.mean()
+        if mean > 0:
+            best = max(best, float(profile.std() / mean))
+    return best
+
+
+def text_runs_vertically(binary: np.ndarray) -> bool:
+    """True if the text lines run top-to-bottom (page photographed 90° off).
+
+    The ink is resized to a square so both directions are measured on equal
+    terms, then the line-band score of the image is compared with that of
+    its transpose.
+    """
+    ink = (binary == 0).astype(np.float32)
+    if ink.mean() < 0.002:
+        return False
+    ink = cv2.resize(ink, (600, 600), interpolation=cv2.INTER_AREA)
+    horizontal = _line_band_score(ink)
+    vertical = _line_band_score(np.ascontiguousarray(ink.T))
+    logger.debug("orientation bands: horizontal=%.3f vertical=%.3f", horizontal, vertical)
+    return vertical > horizontal
+
+
 def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
                denoise_strength: float = 7.0,
-               max_skew: float = 15.0) -> PreprocessResult:
+               max_skew: float = 15.0,
+               quarter_turns: int = 0) -> PreprocessResult:
     """Run the full cleaning pipeline on one uploaded image.
 
     Steps:
+        0. Undo a 90/180/270 degree page rotation (``quarter_turns`` CCW,
+           decided by the caller - see OcrPipeline._detect_orientation).
         1. Down-scale very large photos (keeps latency predictable).
         2. Grayscale + non-local-means denoising.
         3. Shadow / illumination normalisation.
@@ -297,6 +374,9 @@ def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
         6. Re-binarise the straightened image and remove specks.
     """
     orig_h, orig_w = image_bgr.shape[:2]
+
+    # 0. Quarter-turn rotation (recorded in the affine matrix).
+    image_bgr, turn_m = rotate90(image_bgr, quarter_turns)
 
     # 1. Down-scale (recorded in the affine matrix).
     scale = min(1.0, max_side / float(max(orig_h, orig_w)))
@@ -328,8 +408,9 @@ def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
     binary = remove_small_specks(binary, min_area)
     binary = remove_line_artifacts(binary)
 
-    # Compose scale then rotation: p' = R * (S * p)
-    full = np.vstack([rot_m, [0, 0, 1]]) @ np.vstack([scale_m, [0, 0, 1]])
+    # Compose quarter-turn, then scale, then deskew: p' = R * (S * (T * p))
+    full = (np.vstack([rot_m, [0, 0, 1]]) @ np.vstack([scale_m, [0, 0, 1]])
+            @ np.vstack([turn_m, [0, 0, 1]]))
     logger.debug("preprocess: scale=%.3f angle=%.2f size=%s", scale, angle,
                  gray.shape[::-1])
     return PreprocessResult(color=color, gray=gray, binary=binary,

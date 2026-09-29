@@ -4,7 +4,7 @@
 |---|---|
 | `main.py` | FastAPI app: `POST /api/v1/ocr`, `GET /health` |
 | `ocr_pipeline.py` | Layout → lines → UTRNet ‖ PaddleOCR → **confidence router** |
-| `image_processing.py` | OpenCV: deskew, shadow removal, adaptive binarisation, denoise, paragraph/line segmentation |
+| `image_processing.py` | OpenCV: 90°/180°/270° page orientation, deskew, shadow removal, adaptive binarisation, denoise, paragraph/line segmentation |
 | `UTRNet-High-Resolution-Urdu-Text-Recognition/` | Cloned UTRNet repo + `saved_models/UTRNet-Large/best_norm_ED.pth` |
 | `temp_uploads/` | Uploads are stored here while they are processed, then deleted (`KEEP_UPLOADS=1` keeps them) |
 
