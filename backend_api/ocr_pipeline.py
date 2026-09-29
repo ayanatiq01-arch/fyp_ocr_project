@@ -323,7 +323,8 @@ class TextDetector:
         self._lock = threading.Lock()
         logger.info("PaddleOCR text detector loaded: %s", model_name)
 
-    def detect(self, gray: np.ndarray, binary: np.ndarray) -> List[ip.Box]:
+    def _detect_raw(self, gray: np.ndarray) -> List[ip.Box]:
+        """Axis-aligned boxes of the detector's polygons, clipped to the image."""
         with self._lock:
             out = self.model.predict(input=cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))[0]
         h, w = gray.shape[:2]
@@ -335,34 +336,112 @@ class TextDetector:
             box = (max(0, x1), max(0, y1), min(w, x2), min(h, y2))
             if box[2] - box[0] >= 6 and box[3] - box[1] >= 6:
                 boxes.append(box)
-        if not boxes:
-            return self._fallback(binary, [])
-        return self._fallback(binary, self._split_tall(binary, boxes))
+        return boxes
 
-    @staticmethod
-    def _split_tall(binary: np.ndarray, boxes: List[ip.Box]) -> List[ip.Box]:
-        """A box much taller than a typical line holds several merged lines:
-        split it with the projection-profile line segmenter."""
+    def detect(self, gray: np.ndarray, binary: np.ndarray) -> List[ip.Box]:
+        boxes = self._detect_raw(gray)
+        if not boxes:
+            return self._drop_vertical_strips(self._fallback(binary, []))
+        boxes = self._drop_vertical_strips(boxes)
+        boxes = self._merge_stacked(self._split_tall(gray, binary, boxes))
+        # The OpenCV fallback can pick up page borders too: filter again.
+        return self._drop_vertical_strips(self._fallback(binary, boxes))
+
+    def _split_tall(self, gray: np.ndarray, binary: np.ndarray,
+                    boxes: List[ip.Box]) -> List[ip.Box]:
+        """A box much taller than a typical line holds several merged lines
+        (common for a column of short Arabic words with heavy harakat).
+
+        The region is enlarged 2x and detected again: at the larger scale the
+        detector separates the lines itself. If that still gives one box,
+        the projection-profile line segmenter is used instead.
+        """
         median_h = float(np.median([b[3] - b[1] for b in boxes]))
         result = []
         for b in boxes:
-            if b[3] - b[1] > 1.8 * median_h:
-                bands = ip.segment_lines(ip.crop(binary, b))
-                if len(bands) >= 2:
-                    result.extend((b[0], b[1] + t, b[2], b[1] + bt) for t, bt in bands)
-                    continue
-            result.append(b)
+            if b[3] - b[1] <= 1.8 * median_h:
+                result.append(b)
+                continue
+            pad = int(0.2 * median_h)
+            x0, y0 = max(0, b[0] - pad), max(0, b[1] - pad)
+            region = ip.crop(gray, (x0, y0, b[2] + pad, b[3] + pad))
+            big = cv2.resize(region, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            sub = [(x0 + s[0] // 2, y0 + s[1] // 2, x0 + -(-s[2] // 2), y0 + -(-s[3] // 2))
+                   for s in self._detect_raw(big)]
+            sub = [s for s in sub if s[3] - s[1] >= 0.4 * median_h]
+            if len(sub) >= 2:
+                result.extend(sub)
+                continue
+            bands = ip.segment_lines(ip.crop(binary, b))
+            if len(bands) >= 2:
+                result.extend((b[0], b[1] + t, b[2], b[1] + bt) for t, bt in bands)
+            else:
+                result.append(b)
         return result
 
     @staticmethod
+    def _drop_vertical_strips(boxes: List[ip.Box]) -> List[ip.Box]:
+        """Remove tall, narrow boxes: decorative page borders and the book's
+        fold, which the detector often reports as text. Urdu/Arabic lines run
+        horizontally, so a box much taller than a line yet narrower than one
+        line height cannot be text."""
+        median_h = float(np.median([b[3] - b[1] for b in boxes]))
+        kept = [b for b in boxes
+                if not (b[3] - b[1] > 2.5 * median_h and b[2] - b[0] < 0.8 * median_h)]
+        if len(kept) < len(boxes):
+            logger.info("dropped %d border/ornament strips", len(boxes) - len(kept))
+        return kept or boxes
+
+    @staticmethod
+    def _merge_stacked(boxes: List[ip.Box]) -> List[ip.Box]:
+        """Re-join a word the detector cut into an upper and a lower part.
+
+        With heavy harakat (fatha, kasra, shadda) on short Arabic words the
+        marks above and the letters below can come out as two boxes stacked
+        on top of each other. Two boxes are merged when they overlap
+        horizontally for most of the narrower one, the vertical gap is small
+        and the result is still no taller than a normal line.
+        """
+        if len(boxes) < 2:
+            return boxes
+        median_h = float(np.median([b[3] - b[1] for b in boxes]))
+        merged = True
+        boxes = list(boxes)
+        while merged:
+            merged = False
+            for i in range(len(boxes)):
+                for j in range(i + 1, len(boxes)):
+                    a, b = boxes[i], boxes[j]
+                    overlap_x = min(a[2], b[2]) - max(a[0], b[0])
+                    narrower = min(a[2] - a[0], b[2] - b[0])
+                    gap_y = max(a[1], b[1]) - min(a[3], b[3])      # < 0 if overlapping
+                    union = ip.union_box([a, b])
+                    if overlap_x > 0.6 * narrower and gap_y < 0.3 * median_h and \
+                            union[3] - union[1] <= 1.6 * median_h:
+                        boxes[i] = union
+                        del boxes[j]
+                        merged = True
+                        break
+                if merged:
+                    break
+        return boxes
+
+    @staticmethod
     def _fallback(binary: np.ndarray, boxes: List[ip.Box]) -> List[ip.Box]:
-        """Safety net: text the detector missed is found with OpenCV on the
-        ink that is not covered by any box. Small leftovers (harakat, dots
-        just outside a tight box) are ignored."""
-        median_h = float(np.median([b[3] - b[1] for b in boxes])) if boxes else 0.0
+        """Safety net: a word or line the detector missed is found with
+        OpenCV on the ink not covered by any box.
+
+        On real photos the uncovered ink is mostly NOT text (page borders,
+        the other page, the table cloth, stains), so a candidate is only
+        accepted when it looks like one printed line: 0.5-1.6 line heights
+        tall, at most 8 line heights wide, and centred inside the area where
+        the detector found text. With no detected boxes at all (e.g. a very
+        faint scan) every paragraph line is accepted."""
         uncovered = binary.copy()
         for b in boxes:
             uncovered[b[1]:b[3], b[0]:b[2]] = 255
+        median_h = float(np.median([b[3] - b[1] for b in boxes])) if boxes else 0.0
+        area = ip.union_box(boxes) if boxes else None
         extra = []
         for para in ip.detect_paragraphs(uncovered):
             para_bin = ip.crop(uncovered, para)
@@ -371,8 +450,14 @@ class TextDetector:
                 if ink is None:
                     continue
                 box = (para[0] + ink[0], para[1] + top + ink[1], para[0] + ink[2], para[1] + top + ink[3])
+                if area is None:
+                    extra.append(box)
+                    continue
                 bh, bw = box[3] - box[1], box[2] - box[0]
-                if median_h == 0 or (bh >= 0.5 * median_h and bw >= 0.5 * median_h):
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                line_like = 0.5 * median_h <= bh <= 1.6 * median_h and 0.5 * median_h <= bw <= 8 * median_h
+                inside = area[0] < cx < area[2] and area[1] < cy < area[3]
+                if line_like and inside:
                     extra.append(box)
         if extra:
             logger.info("detector fallback added %d boxes", len(extra))
@@ -554,6 +639,63 @@ def _assign_columns(block: Block, line_h: float) -> None:
     block.columns = len(anchors)
 
 
+def _align_table_rows(block: Block, line_h: float) -> None:
+    """Rebuild a table's rows column by column with sequence alignment.
+
+    Within one column the cells are simply ordered top to bottom. Each next
+    column (right to left) is aligned to the rows built so far with dynamic
+    programming (like Needleman-Wunsch): matching two cells costs their
+    vertical distance, skipping one costs a fixed gap penalty. The reference
+    height of a row is its most recently added cell, so a row that drifts
+    down a curved page is followed step by step, and order is never swapped.
+    Requires cell.column to be set (see _assign_columns).
+    """
+    def cy(c: Cell) -> float:
+        return (c.box[1] + c.box[3]) / 2
+
+    columns = [sorted((c for r in block.rows for c in r.cells if c.column == k), key=cy)
+               for k in range(block.columns)]
+    rows: List[List[Cell]] = []
+    GAP, MAX_DY = 0.6, 0.9 * line_h      # a match (< 0.9) always beats two gaps (1.2)
+    for col in columns:
+        if not col:
+            continue
+        if not rows:
+            rows = [[c] for c in col]
+            continue
+        ref = [cy(r[-1]) for r in rows]
+        m, n = len(ref), len(col)
+        cost = np.full((m + 1, n + 1), np.inf)
+        move = np.zeros((m + 1, n + 1), dtype=np.int8)   # 1 match, 2 skip row, 3 new row
+        cost[0, :] = np.arange(n + 1) * GAP
+        cost[:, 0] = np.arange(m + 1) * GAP
+        move[1:, 0], move[0, 1:] = 2, 3
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                dy = abs(ref[i - 1] - cy(col[j - 1]))
+                options = [(cost[i - 1, j] + GAP, 2), (cost[i, j - 1] + GAP, 3)]
+                if dy < MAX_DY:
+                    options.append((cost[i - 1, j - 1] + dy / line_h, 1))
+                cost[i, j], move[i, j] = min(options)
+        merged: List[List[Cell]] = []
+        i, j = m, n
+        while i > 0 or j > 0:
+            step = move[i, j]
+            if step == 1:
+                merged.append(rows[i - 1] + [col[j - 1]])
+                i, j = i - 1, j - 1
+            elif step == 2:
+                merged.append(rows[i - 1])
+                i -= 1
+            else:
+                merged.append([col[j - 1]])
+                j -= 1
+        rows = merged[::-1]
+
+    block.rows = [Row(box=ip.union_box([c.box for c in cells]), cells=cells) for cells in rows]
+    block.box = ip.union_box([r.box for r in block.rows])
+
+
 def build_layout(boxes: List[ip.Box]) -> List[Block]:
     """Re-create the page structure from the auto-cropped boxes.
 
@@ -598,6 +740,7 @@ def build_layout(boxes: List[ip.Box]) -> List[Block]:
         if len(block.rows) >= 2 and gapped >= 0.5 * len(block.rows):
             block.type = "Table"
             _assign_columns(block, line_h)
+            _align_table_rows(block, line_h)
         elif len(block.rows) == 1 and len(blocks) > 1 and (
                 is_heading(block.rows[0]) or
                 (i == 0 and block.box[3] - block.box[1] > 1.2 * line_h)):
@@ -677,6 +820,8 @@ def _is_noise(cell: Cell) -> bool:
     best = max((c.confidence for c in cell.candidates.values()), default=0.0)
     if best < MIN_TEXT_CONFIDENCE:
         return True
+    if len(cell.text.strip()) == 1 and cell.confidence < 0.9:
+        return True                     # a lone uncertain glyph: ornament / stain
     return not _ARABIC_SCRIPT_RE.search(cell.text) and cell.confidence < 0.8
 
 
@@ -703,8 +848,8 @@ class OcrPipeline:
 
     # Boxes sent to both engines together; also the streaming granularity.
     CHUNK = 4
-    # Lines sampled per candidate orientation for the 0/180 decision.
-    ORIENTATION_SAMPLE_LINES = 5
+    # Detected boxes read upright and flipped for the 0/180 decision.
+    ORIENTATION_SAMPLE_LINES = 8
 
     def __init__(self, device: str = OCR_DEVICE):
         """``device``: "cpu" or "gpu" (PyTorch 'cuda' / Paddle 'gpu:0')."""
@@ -757,13 +902,19 @@ class OcrPipeline:
                                               bullets marked)
         """
         t0 = time.perf_counter()
-        turns = self._detect_orientation(image_bgr)
+        # Orientation: text axis from profiles, then 0 vs 180 deg checked on
+        # the detected text boxes. Only an upside-down page is processed twice.
+        turns, flipped_turns = self._orientation_candidates(image_bgr)
         pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
+        boxes = self.detector.detect(pre.gray, pre.binary)
+        if self._is_upside_down(pre, boxes):
+            turns = flipped_turns
+            pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
+            boxes = self.detector.detect(pre.gray, pre.binary)
 
         # LayoutParser only supplies block-type hints, so it runs in the
         # background and is applied at the end - it never delays the text.
         fut_hints = self._layout_executor.submit(self.layout.detect, pre.color)
-        boxes = self.detector.detect(pre.gray, pre.binary)
         blocks = build_layout(boxes)
         result = PipelineResult(pre=pre, blocks=blocks, layout_engine=self.layout.engine,
                                 processing_ms=0, rotation=turns * 90)
@@ -825,6 +976,14 @@ class OcrPipeline:
                 continue
             block.rows = kept_rows
             block.box = ip.union_box([r.box for r in kept_rows])
+            if block.type == "Table":
+                # Re-number columns: a column may have held only noise.
+                used = sorted({c.column for r in kept_rows for c in r.cells})
+                remap = {old: new for new, old in enumerate(used)}
+                for r in kept_rows:
+                    for c in r.cells:
+                        c.column = remap[c.column]
+                block.columns = len(used)
             if block.type == "Text":
                 texts = [r.cells[0].text for r in kept_rows]
                 listy = sum(1 for r, t in zip(kept_rows, texts) if r.is_bullet or _NUMBERED_RE.match(t))
@@ -833,49 +992,30 @@ class OcrPipeline:
             kept_blocks.append(block)
         result.blocks = kept_blocks
 
-    def _detect_orientation(self, image_bgr: np.ndarray) -> int:
-        """Return how many CCW quarter turns make the page upright.
+    @staticmethod
+    def _orientation_candidates(image_bgr: np.ndarray) -> Tuple[int, int]:
+        """Projection profiles decide whether text lines run horizontally
+        (candidates 0 / 180 deg) or vertically (90 / 270 deg). Returned as
+        CCW quarter turns: (most likely, same axis turned 180 deg)."""
+        _, binary = ip.quick_binary(image_bgr)
+        return (1, 3) if ip.text_runs_vertically(binary) else (0, 2)
 
-        1. Projection profiles decide whether text lines currently run
-           horizontally (candidates 0 / 180 deg) or vertically (90 / 270).
-        2. The two remaining candidates differ by 180 deg. First the
-           baseline position is checked (Arabic-script ink is densest in the
-           lower part of a line). If that is not clear-cut, both candidates
-           are read with the fast PaddleOCR recogniser on a few of the widest
-           lines; upside-down text gets a much lower confidence.
-        """
-        gray, binary = ip.quick_binary(image_bgr)
-        candidates = (1, 3) if ip.text_runs_vertically(binary) else (0, 2)
-
-        first, _ = ip.rotate90(binary, candidates[0])
-        baseline = ip.baseline_position(first)
-        if abs(baseline - 0.5) >= 0.05:
-            best = candidates[0] if baseline > 0.5 else candidates[1]
-            logger.info("orientation: candidates=%s baseline=%.2f -> rotate %d deg",
-                        [c * 90 for c in candidates], baseline, best * 90)
-            return best
-
-        scores = {}
-        for k in candidates:
-            g, _ = ip.rotate90(gray, k)
-            b, _ = ip.rotate90(binary, k)
-            samples = []
-            for para in ip.detect_paragraphs(b):
-                para_bin = ip.crop(b, para)
-                for top, bottom in ip.segment_lines(para_bin):
-                    ink = ip.ink_bounds(para_bin[top:bottom])
-                    if ink is None:
-                        continue
-                    box = (para[0] + ink[0], para[1] + top, para[0] + ink[2], para[1] + bottom)
-                    if box[3] - box[1] >= 8:
-                        samples.append(ip.crop(g, box))
-            samples.sort(key=lambda s: s.shape[1], reverse=True)
-            samples = samples[:self.ORIENTATION_SAMPLE_LINES]
-            results = self.arabic.recognize_batch(samples) if samples else []
-            scores[k] = float(np.mean([r.confidence for r in results])) if results else 0.0
-
-        best = max(candidates, key=lambda k: scores[k])
-        logger.info("orientation: candidates=%s scores=%s -> rotate %d deg",
-                    [c * 90 for c in candidates],
-                    {c * 90: round(s, 3) for c, s in scores.items()}, best * 90)
-        return best
+    def _is_upside_down(self, pre: ip.PreprocessResult, boxes: List[ip.Box]) -> bool:
+        """Read a sample of the DETECTED text boxes with the fast PaddleOCR
+        recogniser as they are and turned 180 deg. Upside-down Arabic-script
+        text gets a clearly lower confidence. Using detector boxes (not raw
+        ink) keeps page borders and background patterns out of the test."""
+        if not boxes:
+            return False
+        median_h = float(np.median([b[3] - b[1] for b in boxes]))
+        textlike = [b for b in boxes
+                    if 0.5 * median_h <= b[3] - b[1] <= 2 * median_h and b[2] - b[0] >= 1.5 * (b[3] - b[1])]
+        sample = sorted(textlike or boxes, key=lambda b: b[2] - b[0],
+                        reverse=True)[:self.ORIENTATION_SAMPLE_LINES]
+        crops = [self._crop(pre, b) for b in sample]
+        upright = self.arabic.recognize_batch(crops)
+        flipped = self.arabic.recognize_batch([np.ascontiguousarray(np.rot90(c, 2)) for c in crops])
+        up = float(np.mean([r.confidence for r in upright]))
+        down = float(np.mean([r.confidence for r in flipped]))
+        logger.info("orientation check on %d boxes: upright=%.3f flipped=%.3f", len(crops), up, down)
+        return down > up + 0.05

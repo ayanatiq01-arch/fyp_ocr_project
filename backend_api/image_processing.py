@@ -366,30 +366,6 @@ def text_runs_vertically(binary: np.ndarray) -> bool:
     return vertical > horizontal
 
 
-def baseline_position(binary: np.ndarray) -> float:
-    """Median relative height (0 = top, 1 = bottom) of the densest ink row in
-    each text line.
-
-    Arabic-script text sits on a baseline in the lower part of the line, with
-    sparse tall ascenders above, so upright pages give values > 0.5 and
-    upside-down pages < 0.5. Returns 0.5 (undecided) if no lines are found.
-    """
-    positions = []
-    for para in detect_paragraphs(binary):
-        para_bin = crop(binary, para)
-        for top, bottom in segment_lines(para_bin):
-            band = para_bin[top:bottom]
-            ink = ink_bounds(band)
-            if ink is None:
-                continue
-            band = (band[ink[1]:ink[3]] == 0).astype(np.float32)
-            if band.shape[0] < 8 or band.sum() < 50:
-                continue
-            profile = np.convolve(band.sum(axis=1), np.ones(3) / 3, mode="same")
-            positions.append(float(np.argmax(profile)) / (len(profile) - 1))
-    return float(np.median(positions)) if positions else 0.5
-
-
 def preprocess(image_bgr: np.ndarray, *, max_side: int = 2400,
                denoise_strength: float = 7.0,
                max_skew: float = 15.0,
