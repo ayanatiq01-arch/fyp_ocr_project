@@ -1022,15 +1022,18 @@ class OcrPipeline:
         self._layout_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ API
-    def process(self, image_bgr: np.ndarray) -> PipelineResult:
+    # Values accepted for the ``language`` option.
+    LANGUAGES = ("mixed", LANG_URDU, LANG_ARABIC)
+
+    def process(self, image_bgr: np.ndarray, language: str = "mixed") -> PipelineResult:
         """Run everything and return the final result."""
         result = None
-        for event, payload in self.process_iter(image_bgr):
+        for event, payload in self.process_iter(image_bgr, language):
             if event == "done":
                 result = payload
         return result
 
-    def process_iter(self, image_bgr: np.ndarray
+    def process_iter(self, image_bgr: np.ndarray, language: str = "mixed"
                      ) -> Iterator[Tuple[str, object]]:
         """Generator for streaming. Yields, in order:
 
@@ -1038,7 +1041,16 @@ class OcrPipeline:
         ("cell",  (block_i, row_i, cell_i, Cell))   one per box, reading order
         ("done",  PipelineResult)             final page (noise removed,
                                               bullets marked)
+
+        ``language`` (chosen by the user in the app):
+          * "mixed"  - both engines read every box, the confidence router
+                       decides (default, unchanged behaviour);
+          * "urdu"   - only UTRNet reads the boxes (page known to be Urdu);
+          * "arabic" - only PaddleOCR reads the boxes; also much faster,
+                       because the slow UTRNet is skipped.
         """
+        if language not in self.LANGUAGES:
+            raise ValueError(f"language must be one of {self.LANGUAGES}, got {language!r}")
         t0 = time.perf_counter()
         # Orientation: text axis from profiles, then 0 vs 180 deg checked on
         # the detected text boxes. Only an upside-down page is processed twice.
@@ -1066,11 +1078,24 @@ class OcrPipeline:
         for start in range(0, len(order), self.CHUNK):
             chunk = order[start:start + self.CHUNK]
             images = [self._crop(pre, item[3].box) for item in chunk]
-            # Send the SAME crops to BOTH engines at the same time.
-            fut_u = self._executor.submit(self.urdu.recognize_batch, images)
-            fut_a = self._executor.submit(self.arabic.recognize_batch, images)
-            for (bi, ri, ci, cell), u, a in zip(chunk, fut_u.result(), fut_a.result()):
-                accepted, _ = route_by_confidence(u, a)
+            # Mixed: send the SAME crops to BOTH engines at the same time.
+            # A fixed language runs only that language's engine.
+            def skipped(engine) -> List[EngineResult]:
+                return [EngineResult(engine.name, engine.language, "", 0.0) for _ in images]
+
+            fut_u = self._executor.submit(self.urdu.recognize_batch, images) \
+                if language != LANG_ARABIC else None
+            fut_a = self._executor.submit(self.arabic.recognize_batch, images) \
+                if language != LANG_URDU else None
+            urdu_results = fut_u.result() if fut_u else skipped(self.urdu)
+            arabic_results = fut_a.result() if fut_a else skipped(self.arabic)
+            for (bi, ri, ci, cell), u, a in zip(chunk, urdu_results, arabic_results):
+                if language == LANG_URDU:
+                    accepted = u
+                elif language == LANG_ARABIC:
+                    accepted = a
+                else:
+                    accepted, _ = route_by_confidence(u, a)
                 cell.text = accepted.text
                 cell.language = accepted.language if accepted.text else "unknown"
                 cell.engine = accepted.engine if accepted.text else ""

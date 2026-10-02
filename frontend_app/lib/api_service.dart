@@ -315,8 +315,9 @@ class ApiService {
     }
   }
 
-  Future<http.StreamedResponse> _post(String path, File image) async {
+  Future<http.StreamedResponse> _post(String path, File image, String language) async {
     final request = http.MultipartRequest('POST', Uri.parse('$baseUrl$path'))
+      ..fields['language'] = language
       ..files.add(await http.MultipartFile.fromPath('file', image.path));
     try {
       final response = await _client.send(request).timeout(const Duration(seconds: 60));
@@ -336,8 +337,11 @@ class ApiService {
 
   /// Uploads the whole page photo and yields results as the server reads
   /// them, in reading order.
-  Stream<OcrEvent> scanStream(File image) async* {
-    final response = await _post('/api/v1/ocr/stream', image);
+  ///
+  /// [language]: "mixed" (both engines + confidence router), "urdu" (UTRNet
+  /// only) or "arabic" (PaddleOCR only).
+  Stream<OcrEvent> scanStream(File image, {String language = 'mixed'}) async* {
+    final response = await _post('/api/v1/ocr/stream', image, language);
     final lines = response.stream
         .transform(utf8.decoder) // Urdu/Arabic: always decode as UTF-8
         .transform(const LineSplitter())
@@ -367,8 +371,8 @@ class ApiService {
   }
 
   /// Non-streaming variant: returns the finished page.
-  Future<OcrResult> scanImage(File image) async {
-    final response = await _post('/api/v1/ocr', image);
+  Future<OcrResult> scanImage(File image, {String language = 'mixed'}) async {
+    final response = await _post('/api/v1/ocr', image, language);
     final body = await response.stream.bytesToString().timeout(timeout);
     try {
       return OcrResult.fromJson(jsonDecode(body) as Map<String, dynamic>);

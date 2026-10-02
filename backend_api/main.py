@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -249,6 +249,15 @@ def _read_upload(file: UploadFile) -> tuple[str, Path, np.ndarray]:
     return request_id, temp_path, image
 
 
+LANGUAGE_HELP = ("mixed = both engines + confidence router (default); "
+                 "urdu = UTRNet only; arabic = PaddleOCR only")
+
+
+def _check_language(language: str) -> None:
+    if language not in OcrPipeline.LANGUAGES:
+        raise HTTPException(422, f"language must be one of {', '.join(OcrPipeline.LANGUAGES)}")
+
+
 def _cleanup(path: Path) -> None:
     if not KEEP_UPLOADS:
         path.unlink(missing_ok=True)
@@ -257,11 +266,12 @@ def _cleanup(path: Path) -> None:
 # Plain `def` (not async): OCR is CPU-bound, so FastAPI runs it in its
 # thread pool and the event loop stays responsive for other requests.
 @app.post("/api/v1/ocr", response_model=OcrResponse)
-def ocr(request: Request, file: UploadFile = File(..., description="Whole page photo")
-        ) -> OcrResponse:
+def ocr(request: Request, file: UploadFile = File(..., description="Whole page photo"),
+        language: str = Form("mixed", description=LANGUAGE_HELP)) -> OcrResponse:
+    _check_language(language)
     request_id, temp_path, image = _read_upload(file)
     try:
-        result = request.app.state.pipeline.process(image)
+        result = request.app.state.pipeline.process(image, language)
         response = to_response(request_id, result)
         logger.info("request %s: %d blocks, %d ms", request_id, len(response.blocks),
                     response.processing_ms)
@@ -274,8 +284,9 @@ def ocr(request: Request, file: UploadFile = File(..., description="Whole page p
 
 
 @app.post("/api/v1/ocr/stream")
-def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole page photo")
-               ) -> StreamingResponse:
+def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole page photo"),
+               language: str = Form("mixed", description=LANGUAGE_HELP)) -> StreamingResponse:
+    _check_language(language)
     request_id, temp_path, image = _read_upload(file)
     pipeline: OcrPipeline = request.app.state.pipeline
 
@@ -286,7 +297,7 @@ def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole
 
         try:
             pre = None
-            for event, payload in pipeline.process_iter(image):
+            for event, payload in pipeline.process_iter(image, language):
                 if event == "layout":
                     pre = payload.pre
                     body = to_response(request_id, payload).model_dump()

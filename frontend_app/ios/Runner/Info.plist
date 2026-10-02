@@ -7,7 +7,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Urdu Arabic OCR</string>
+	<string>HarfScan</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Take photos of book pages to digitise them.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

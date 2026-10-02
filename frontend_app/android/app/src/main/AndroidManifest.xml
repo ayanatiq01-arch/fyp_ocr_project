@@ -4,7 +4,7 @@
 
     <!-- usesCleartextTraffic: the backend runs on plain http:// in the local network. -->
     <application
-        android:label="Urdu Arabic OCR"
+        android:label="HarfScan"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
