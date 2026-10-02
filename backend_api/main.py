@@ -33,6 +33,12 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 import numpy as np
+from dotenv import load_dotenv
+
+# API keys (GEMINI_API_KEY) live in backend_api/.env, which git ignores.
+# Loaded before ocr_pipeline is imported, as it reads its settings on import.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -75,6 +81,8 @@ class CellOut(BaseModel):
     confidence: float = Field(..., description="0-100, of the accepted engine")
     candidates: Dict[str, Candidate] = Field(
         default_factory=dict, description="Both engines' raw results, keyed by language")
+    raw_text: str = Field("", description="OCR text before Gemini correction "
+                                          "(empty when AI correction did not run)")
 
 
 class RowOut(BaseModel):
@@ -123,6 +131,8 @@ class OcrResponse(BaseModel):
     formatted_text: str = Field(..., description="Page text: blank line between blocks, "
                                                  "TAB between table columns, '• ' bullets")
     processing_ms: int
+    ai_correction: str = Field("off", description="Gemini model that inspected the boxes, "
+                                                  "'off', or 'failed: <reason>'")
 
 
 def _pct(x: float) -> float:
@@ -139,6 +149,7 @@ def cell_out(pre: ip.PreprocessResult, cell: Cell) -> CellOut:
         confidence=_pct(cell.confidence),
         candidates={lang: Candidate(text=c.text, confidence=_pct(c.confidence))
                     for lang, c in cell.candidates.items()},
+        raw_text=cell.raw_text,
     )
 
 
@@ -174,6 +185,7 @@ def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
         reading_order=reading,
         formatted_text=result.formatted_text(),
         processing_ms=result.processing_ms,
+        ai_correction=result.ai_correction,
     )
 
 
@@ -251,6 +263,8 @@ def _read_upload(file: UploadFile) -> tuple[str, Path, np.ndarray]:
 
 LANGUAGE_HELP = ("mixed = both engines + confidence router (default); "
                  "urdu = UTRNet only; arabic = PaddleOCR only")
+AI_HELP = ("true = Gemini visually inspects every box crop against its OCR text and "
+           "fixes spelling / spacing (needs GEMINI_API_KEY)")
 
 
 def _check_language(language: str) -> None:
@@ -267,11 +281,12 @@ def _cleanup(path: Path) -> None:
 # thread pool and the event loop stays responsive for other requests.
 @app.post("/api/v1/ocr", response_model=OcrResponse)
 def ocr(request: Request, file: UploadFile = File(..., description="Whole page photo"),
-        language: str = Form("mixed", description=LANGUAGE_HELP)) -> OcrResponse:
+        language: str = Form("mixed", description=LANGUAGE_HELP),
+        ai_correct: bool = Form(True, description=AI_HELP)) -> OcrResponse:
     _check_language(language)
     request_id, temp_path, image = _read_upload(file)
     try:
-        result = request.app.state.pipeline.process(image, language)
+        result = request.app.state.pipeline.process(image, language, ai_correct)
         response = to_response(request_id, result)
         logger.info("request %s: %d blocks, %d ms", request_id, len(response.blocks),
                     response.processing_ms)
@@ -285,7 +300,8 @@ def ocr(request: Request, file: UploadFile = File(..., description="Whole page p
 
 @app.post("/api/v1/ocr/stream")
 def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole page photo"),
-               language: str = Form("mixed", description=LANGUAGE_HELP)) -> StreamingResponse:
+               language: str = Form("mixed", description=LANGUAGE_HELP),
+               ai_correct: bool = Form(True, description=AI_HELP)) -> StreamingResponse:
     _check_language(language)
     request_id, temp_path, image = _read_upload(file)
     pipeline: OcrPipeline = request.app.state.pipeline
@@ -297,7 +313,7 @@ def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole
 
         try:
             pre = None
-            for event, payload in pipeline.process_iter(image, language):
+            for event, payload in pipeline.process_iter(image, language, ai_correct):
                 if event == "layout":
                     pre = payload.pre
                     body = to_response(request_id, payload).model_dump()
@@ -307,6 +323,8 @@ def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole
                     bi, ri, ci, cell = payload
                     yield line({"event": "cell", "block": bi, "row": ri, "cell": ci,
                                 **cell_out(pre, cell).model_dump()})
+                elif event == "status":
+                    yield line({"event": "status", "stage": payload})
                 elif event == "done":
                     body = to_response(request_id, payload).model_dump()
                     logger.info("stream %s: %d blocks, %d ms", request_id,

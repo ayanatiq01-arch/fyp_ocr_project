@@ -1,7 +1,7 @@
 name: frontend_app
 description: HarfScan - Bilingual (Urdu & Arabic) OCR scanner and book digitizer.
 publish_to: "none"
-version: 2.1.0+3
+version: 2.3.0+5
 
 environment:
   sdk: ^3.13.0

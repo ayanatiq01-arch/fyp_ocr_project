@@ -75,6 +75,7 @@ enum _Phase { reading, selecting, failed }
 class _SelectTextScreenState extends State<SelectTextScreen> {
   StreamSubscription<OcrEvent>? _scan;
   _Phase _phase = _Phase.reading;
+  bool _aiChecking = false; // Gemini is inspecting the boxes
   String _error = '';
   OcrResult? _result;
   List<_Word> _words = const [];
@@ -110,9 +111,11 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       _result = null;
       _words = const [];
       _anchor = _focus = null;
+      _aiChecking = false;
     });
     _scan = widget.settings.api
-        .scanStream(widget.image, language: widget.session.language.apiValue)
+        .scanStream(widget.image,
+            language: widget.session.language.apiValue, aiCorrect: widget.settings.aiCorrect)
         .listen(
       (event) {
         if (!mounted) return;
@@ -126,6 +129,8 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
                 final cells = r.blocks[block].rows[row].cells;
                 if (index < cells.length) cells[index] = cell;
               }
+            case StatusEvent(:final stage):
+              _aiChecking = stage == 'ai_correction';
             case DoneEvent(:final result):
               _result = result;
               _words = _buildWords(result);
@@ -462,16 +467,18 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       mainAxisSize: MainAxisSize.min,
       children: [
         LinearProgressIndicator(
-          value: total == 0 ? null : read / total,
+          value: total == 0 || _aiChecking ? null : read / total,
           color: HarfColors.brightGold,
           backgroundColor: HarfColors.slate,
           minHeight: 6,
           borderRadius: BorderRadius.circular(3),
         ),
         const SizedBox(height: 10),
-        Text(total == 0
-            ? 'Finding text on the page...'
-            : 'Reading ${widget.session.language.label} text  $read / $total'),
+        Text(_aiChecking
+            ? 'Gemini AI is checking the text against the image...'
+            : total == 0
+                ? 'Finding text on the page...'
+                : 'Reading ${widget.session.language.label} text  $read / $total'),
         const SizedBox(height: 4),
         TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
       ],

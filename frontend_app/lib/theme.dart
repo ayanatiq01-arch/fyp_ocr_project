@@ -28,6 +28,9 @@ class HarfColors {
 
   /// Background behind words read with low confidence (< 70 %).
   static const Color lowConfidence = Color(0x66FFD700);
+
+  /// Underline of text corrected by Gemini's visual inspection.
+  static const Color aiCorrected = Color(0xFF7CE0A3);
 }
 
 ThemeData buildHarfTheme() {

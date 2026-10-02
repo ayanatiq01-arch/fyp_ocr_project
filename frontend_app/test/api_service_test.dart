@@ -58,4 +58,17 @@ void main() {
     expect(api.baseUrl, 'http://10.0.2.2:8000');
     api.dispose();
   });
+
+  test('Gemini: corrected boxes keep the OCR reading in raw_text', () {
+    final fixed = OcrCell.fromJson(
+        {'bbox': [0, 0, 10, 10], 'text': 'برصغیر کی', 'raw_text': 'برصغیرکی', 'confidence': 62.5});
+    expect(fixed.isAiCorrected, isTrue);
+    expect(fixed.rawText, 'برصغیرکی');
+
+    final same = OcrCell.fromJson(
+        {'bbox': [0, 0, 10, 10], 'text': 'اردو', 'raw_text': 'اردو', 'confidence': 90});
+    final oldServer = OcrCell.fromJson({'bbox': [0, 0, 10, 10], 'text': 'اردو', 'confidence': 90});
+    expect(same.isAiCorrected, isFalse);
+    expect(oldServer.isAiCorrected, isFalse);
+  });
 }

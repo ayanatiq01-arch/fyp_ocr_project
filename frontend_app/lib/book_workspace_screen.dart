@@ -165,10 +165,12 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
   Widget _buildPages() {
     final s = widget.settings;
     final low = s.highlightLowConfidence ? _session.lowConfidenceCount(s.lowConfidenceThreshold) : 0;
+    final ai = _session.aiCorrectedCount;
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 96),
       children: [
         if (low > 0) _ReviewLegend(count: low, threshold: s.lowConfidenceThreshold),
+        if (ai > 0) _AiLegend(count: ai),
         for (final page in _session.pages)
           _PageCard(page: page, isLow: s.isLowConfidence, onRemove: () => _confirmRemove(page)),
       ],
@@ -198,6 +200,29 @@ class _ReviewLegend extends StatelessWidget {
           Expanded(
             child: Text(
                 '$count word(s) read with < ${threshold.round()}% confidence - please review',
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AiLegend extends StatelessWidget {
+  const _AiLegend({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
+      child: Row(
+        children: [
+          const SizedBox(width: 18, child: Divider(color: HarfColors.aiCorrected, thickness: 2.5)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('$count box(es) corrected by Gemini AI - tap to see the OCR reading',
                 style: Theme.of(context).textTheme.bodySmall),
           ),
         ],
@@ -304,7 +329,8 @@ class _BlockView extends StatelessWidget {
   }
 }
 
-/// A recognised word / box. Low-confidence words get a gold background.
+/// A recognised word / box. Low-confidence words get a gold background;
+/// text corrected by Gemini is underlined in green (tap shows the OCR text).
 class _Word extends StatelessWidget {
   const _Word({required this.cell, required this.bold, required this.isLow});
 
@@ -318,14 +344,27 @@ class _Word extends StatelessWidget {
     final low = isLow(cell.confidence);
     final style = scriptStyle(cell.language, size: bold ? 22 : 19)
         .copyWith(fontWeight: bold ? FontWeight.w700 : FontWeight.w400);
+    final ai = cell.isAiCorrected;
     return Tooltip(
-      message: '${cell.engine} - ${cell.confidence.toStringAsFixed(0)}% confidence',
+      message: ai
+          ? 'Corrected by Gemini AI\nOCR read: ${cell.rawText}'
+          : '${cell.engine} - ${cell.confidence.toStringAsFixed(0)}% confidence',
+      triggerMode: TooltipTriggerMode.tap,
       child: Container(
         padding: low ? const EdgeInsets.symmetric(horizontal: 4) : EdgeInsets.zero,
         decoration: low
             ? BoxDecoration(color: HarfColors.lowConfidence, borderRadius: BorderRadius.circular(4))
             : null,
-        child: Text(cell.text, style: style),
+        child: Text(
+          cell.text,
+          style: ai
+              ? style.copyWith(
+                  decoration: TextDecoration.underline,
+                  decorationColor: HarfColors.aiCorrected,
+                  decorationThickness: 2,
+                )
+              : style,
+        ),
       ),
     );
   }

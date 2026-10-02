@@ -25,6 +25,9 @@ Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline with a
                 route_by_confidence()     higher confidence wins, other discarded
                         │
                         ▼
+    GeminiVisionCorrector    each box crop + its OCR text -> Gemini Flash (vision)
+                        │    inspects the image, fixes spelling / spacing
+                        ▼
     results are streamed as they are ready; finally the page is re-assembled
     with its paragraphs, bullets and table columns.
 
@@ -46,6 +49,7 @@ Models (all published, downloaded as-is):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -54,6 +58,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -91,6 +96,24 @@ ROUTER_URDU_MARGIN = float(os.getenv("ROUTER_URDU_MARGIN", "0.0"))
 # Results below this confidence (from BOTH engines) are treated as non-text
 # (page ornaments, stains, torn edges) and dropped from the final page.
 MIN_TEXT_CONFIDENCE = float(os.getenv("MIN_TEXT_CONFIDENCE", "0.5"))
+# AI vision inspection (GeminiVisionCorrector). Needs GEMINI_API_KEY
+# (backend_api/.env); GEMINI_CORRECTION=0 switches it off.
+GEMINI_CORRECTION = os.getenv("GEMINI_CORRECTION", "1") != "0"
+# Flash models tried in order. The free tier allows only ~20 requests per
+# day PER MODEL, so when one model's daily quota is used up (or it is
+# overloaded) the next one takes over.
+GEMINI_MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,"
+                     "gemini-3.5-flash,gemini-3-flash-preview").split(",") if m.strip()]
+# Boxes per request. Smaller batches run in parallel and answer sooner; each
+# batch is one request against the daily quota.
+GEMINI_BATCH = int(os.getenv("GEMINI_BATCH", "20"))
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "240"))  # seconds per request
+# Gemini 3 models think before answering; "low" keeps a page at ~1 minute.
+GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low")
+# A box whose corrected text shares less than this with the OCR text is
+# rejected (Gemini rewrote / invented text instead of correcting it).
+GEMINI_MIN_SIMILARITY = float(os.getenv("GEMINI_MIN_SIMILARITY", "0.65"))
 
 LANG_URDU = "urdu"
 LANG_ARABIC = "arabic"
@@ -120,6 +143,7 @@ class Cell:
     confidence: float = 0.0                # of the accepted engine, 0-1
     candidates: Dict[str, EngineResult] = field(default_factory=dict)
     done: bool = False
+    raw_text: str = ""                     # OCR text before AI correction
 
 
 @dataclass
@@ -296,6 +320,159 @@ class PaddleArabicRecognizer:
             conf = float(out["rec_score"]) if text else 0.0
             results.append(EngineResult(self.name, self.language, text, conf))
         return results
+
+
+# --------------------------------------------------------------------------- #
+# AI vision inspection: Gemini compares each crop with its OCR text
+# --------------------------------------------------------------------------- #
+class GeminiVisionCorrector:
+    """Multimodal post-correction with Google Gemini (Flash, vision).
+
+    For every text box Gemini receives BOTH the cropped image and the raw OCR
+    text, visually inspects the crop, and returns the text exactly as printed
+    (spelling, dots, missing / extra letters and word spacing fixed). Boxes
+    are sent in batches (one request per ``GEMINI_BATCH`` boxes, run in
+    parallel); the answer is structured JSON so every box keeps its place in
+    the page layout. Any failure leaves the OCR text unchanged.
+    """
+
+    URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    PROMPT = (
+        "You are an expert proofreader of printed Urdu (Nastaliq) and Arabic (Naskh) text "
+        "from historical books. Below are numbered text boxes. Each box has the raw output "
+        "of an OCR engine followed by the cropped image of that box.\n"
+        "For every box: look carefully at the image, compare it with the OCR text, and "
+        "return the text EXACTLY as it is printed in the image. Fix wrong or missing "
+        "letters, wrong dots, missing or extra spaces between words, and joined or split "
+        "words. Keep harakat (diacritics) only where they are printed. Keep digits, "
+        "brackets and punctuation as printed.\n"
+        "Rules: do not translate, do not modernise the spelling, do not add words that are "
+        "not in the image, do not merge or reorder boxes. If the OCR text is already "
+        "correct, return it unchanged. If the image is unreadable or contains no text, "
+        "return the OCR text unchanged. Write the text in normal logical (right-to-left "
+        "reading) order. Return one entry per box with its box number."
+    )
+
+    def __init__(self, api_key: str, models: Sequence[str] = tuple(GEMINI_MODELS)):
+        import requests
+        self.api_key = api_key
+        self.models = list(models)
+        self.last_model = ""                       # model that answered last
+        self._resting: Dict[str, float] = {}      # model -> time its quota is back
+        self._http = requests.Session()
+        logger.info("Gemini vision correction enabled: %s", ", ".join(self.models))
+
+    @classmethod
+    def from_env(cls) -> Optional["GeminiVisionCorrector"]:
+        key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not key or not GEMINI_CORRECTION:
+            logger.info("Gemini vision correction disabled (no GEMINI_API_KEY)")
+            return None
+        return cls(key)
+
+    def correct(self, items: Sequence[Tuple[np.ndarray, str, str]]) -> List[Optional[str]]:
+        """``items``: (grayscale crop, OCR text, language) per box. Returns the
+        corrected text per box (None = keep the OCR text)."""
+        batches = [list(range(i, min(i + GEMINI_BATCH, len(items))))
+                   for i in range(0, len(items), GEMINI_BATCH)]
+        out: List[Optional[str]] = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(batches)))) as pool:
+            for idx, fixed in zip(batches, pool.map(
+                    lambda b: self._request([items[i] for i in b]), batches)):
+                for i, text in zip(idx, fixed):
+                    out[i] = text
+        return out
+
+    @staticmethod
+    def _png(gray: np.ndarray) -> str:
+        import base64
+        h, w = gray.shape[:2]
+        if w > 1024:  # long lines: keep the request small, text stays legible
+            gray = cv2.resize(gray, (1024, max(1, int(h * 1024 / w))), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", gray)
+        return base64.b64encode(buf.tobytes()).decode("ascii")
+
+    def _request(self, items: Sequence[Tuple[np.ndarray, str, str]]) -> List[Optional[str]]:
+        parts: List[dict] = [{"text": self.PROMPT}]
+        for k, (crop, text, lang) in enumerate(items, 1):
+            parts.append({"text": f"Box {k} - OCR ({lang}): {text}"})
+            parts.append({"inline_data": {"mime_type": "image/png", "data": self._png(crop)}})
+        body = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "ARRAY",
+                    "items": {"type": "OBJECT",
+                              "properties": {"box": {"type": "INTEGER"},
+                                             "text": {"type": "STRING"}},
+                              "required": ["box", "text"]},
+                },
+                "thinkingConfig": {"thinkingLevel": GEMINI_THINKING},
+            },
+        }
+        data = self._post(body)
+        answer = "".join(p.get("text", "") for p in
+                         data["candidates"][0]["content"].get("parts", []))
+        fixed: List[Optional[str]] = [None] * len(items)
+        for entry in json.loads(answer):
+            k = int(entry.get("box", 0))
+            if 1 <= k <= len(items):
+                fixed[k - 1] = self._accept(items[k - 1][1], str(entry.get("text", "")))
+        return fixed
+
+    def _post(self, body: dict) -> dict:
+        """POST to the first model that has quota left and is not overloaded."""
+        errors = []
+        for model in self.models:
+            if self._resting.get(model, 0) > time.time():
+                continue                                   # daily quota used up
+            resp = None
+            for attempt in range(2):
+                resp = self._http.post(self.URL.format(model=model), json=body,
+                                       timeout=GEMINI_TIMEOUT,
+                                       headers={"x-goog-api-key": self.api_key})
+                if resp.status_code == 200:
+                    self.last_model = model
+                    return resp.json()
+                if resp.status_code == 429:
+                    wait = self._retry_delay(resp)
+                    if "PerDay" in resp.text or wait > 60:
+                        self._resting[model] = time.time() + max(wait, 600)
+                        logger.warning("Gemini %s: daily free quota used up", model)
+                        break                              # next model
+                    time.sleep(wait or 5)                  # per-minute limit: wait, retry
+                    continue
+                if resp.status_code in (500, 503) and attempt == 0:
+                    time.sleep(3)                          # overloaded: one retry
+                    continue
+                break
+            errors.append(f"{model}: HTTP {getattr(resp, 'status_code', '?')}")
+        raise RuntimeError("no Gemini model available (" + "; ".join(errors or ["all resting"]) + ")")
+
+    @staticmethod
+    def _retry_delay(resp) -> float:
+        """Seconds Google asks us to wait (RetryInfo.retryDelay), 0 if unknown."""
+        try:
+            for d in resp.json()["error"].get("details", []):
+                if "retryDelay" in d:
+                    return float(str(d["retryDelay"]).rstrip("s"))
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _accept(ocr: str, ai: str) -> Optional[str]:
+        """Sanity checks on Gemini's answer for one box."""
+        ai = " ".join(ai.split())
+        if not ai:
+            return None                                # never blank out a box
+        if re.search(r"[A-Za-z]", ai) and not re.search(r"[A-Za-z]", ocr):
+            return None                                # explanation / translation, not text
+        if len(ocr) > 3 and SequenceMatcher(None, ocr, ai).ratio() < GEMINI_MIN_SIMILARITY:
+            return None                                # rewritten, not corrected
+        return ai
 
 
 # --------------------------------------------------------------------------- #
@@ -973,6 +1150,7 @@ class PipelineResult:
     layout_engine: str
     processing_ms: int
     rotation: int = 0            # degrees CCW applied to make the page upright
+    ai_correction: str = "off"   # Gemini model used, "off", or "failed: ..."
 
     def formatted_text(self) -> str:
         """Plain text that preserves the page structure: blank line between
@@ -997,6 +1175,7 @@ class OcrPipeline:
         self.arabic = PaddleArabicRecognizer(device="gpu:0" if use_gpu else "cpu")
         self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
+        self.gemini = GeminiVisionCorrector.from_env()
         # Two workers: one per engine, so both read the same boxes concurrently.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
         # LayoutParser runs in the background on its own worker.
@@ -1025,16 +1204,17 @@ class OcrPipeline:
     # Values accepted for the ``language`` option.
     LANGUAGES = ("mixed", LANG_URDU, LANG_ARABIC)
 
-    def process(self, image_bgr: np.ndarray, language: str = "mixed") -> PipelineResult:
+    def process(self, image_bgr: np.ndarray, language: str = "mixed",
+                ai_correct: bool = True) -> PipelineResult:
         """Run everything and return the final result."""
         result = None
-        for event, payload in self.process_iter(image_bgr, language):
+        for event, payload in self.process_iter(image_bgr, language, ai_correct):
             if event == "done":
                 result = payload
         return result
 
-    def process_iter(self, image_bgr: np.ndarray, language: str = "mixed"
-                     ) -> Iterator[Tuple[str, object]]:
+    def process_iter(self, image_bgr: np.ndarray, language: str = "mixed",
+                     ai_correct: bool = True) -> Iterator[Tuple[str, object]]:
         """Generator for streaming. Yields, in order:
 
         ("layout", PipelineResult)            page structure, no text yet
@@ -1048,6 +1228,11 @@ class OcrPipeline:
           * "urdu"   - only UTRNet reads the boxes (page known to be Urdu);
           * "arabic" - only PaddleOCR reads the boxes; also much faster,
                        because the slow UTRNet is skipped.
+
+        ``ai_correct``: after reading, send every box crop together with its
+        OCR text to Gemini for visual inspection and correction (needs
+        GEMINI_API_KEY). Yields ("status", "ai_correction") before it starts.
+        The OCR text is kept in ``Cell.raw_text``.
         """
         if language not in self.LANGUAGES:
             raise ValueError(f"language must be one of {self.LANGUAGES}, got {language!r}")
@@ -1106,11 +1291,40 @@ class OcrPipeline:
 
         apply_layout_hints(result.blocks, fut_hints.result())
         self._finalise(result)
+        if ai_correct and self.gemini is not None:
+            yield "status", "ai_correction"
+            result.ai_correction = self._ai_correct(result)
         result.processing_ms = int((time.perf_counter() - t0) * 1000)
         logger.info("processed %d boxes in %d ms", len(order), result.processing_ms)
         yield "done", result
 
     # ------------------------------------------------------------ helpers
+    def _ai_correct(self, result: PipelineResult) -> str:
+        """Gemini vision inspection of every box. Returns what was used."""
+        t0 = time.perf_counter()
+        boxes = [(row, cell) for b in result.blocks for row in b.rows
+                 for cell in row.cells if cell.text]
+        for _, cell in boxes:
+            cell.raw_text = cell.text
+        try:
+            fixed = self.gemini.correct(
+                [(self._crop(result.pre, c.box), c.text, c.language) for _, c in boxes])
+        except Exception as exc:  # network, quota, bad answer: keep the OCR text
+            logger.warning("Gemini correction failed: %s", exc)
+            return f"failed: {str(exc)[:160]}"
+        changed = 0
+        for (row, cell), text in zip(boxes, fixed):
+            if text is None:
+                continue
+            if row.is_bullet and cell is row.cells[0]:
+                text = text.lstrip(_BULLET_CHARS + " ").strip() or text   # bullet is marked separately
+            if text != cell.text:
+                cell.text = text
+                changed += 1
+        logger.info("Gemini (%s): %d of %d boxes corrected in %d ms", self.gemini.last_model,
+                    changed, len(boxes), (time.perf_counter() - t0) * 1000)
+        return self.gemini.last_model
+
     def _page_boxes(self, pre: ip.PreprocessResult) -> List[ip.Box]:
         """Auto-cropped text boxes of the main page only."""
         boxes = self.detector.detect(pre.gray, pre.binary)

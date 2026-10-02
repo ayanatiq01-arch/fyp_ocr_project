@@ -2,8 +2,9 @@
 //
 // HTTP client for the FastAPI backend (backend_api/main.py).
 //
-//   POST {baseUrl}/api/v1/ocr/stream   multipart "file" -> NDJSON event stream
-//   POST {baseUrl}/api/v1/ocr          multipart "file" -> final JSON
+//   POST {baseUrl}/api/v1/ocr/stream   multipart "file", "language", "ai_correct"
+//                                      -> NDJSON event stream
+//   POST {baseUrl}/api/v1/ocr          same fields -> final JSON
 //   GET  {baseUrl}/health
 //
 // Also contains the typed models for the JSON the backend returns, so the UI
@@ -71,6 +72,7 @@ class OcrCell {
     required this.engine,
     required this.confidence,
     required this.candidates,
+    this.rawText = '',
   });
 
   factory OcrCell.fromJson(Map<String, dynamic> json) => OcrCell(
@@ -83,6 +85,7 @@ class OcrCell {
         candidates: (json['candidates'] as Map<String, dynamic>? ?? {}).map(
           (k, v) => MapEntry(k, EngineCandidate.fromJson(v as Map<String, dynamic>)),
         ),
+        rawText: json['raw_text'] as String? ?? '',
       );
 
   final BBox bbox;
@@ -103,8 +106,14 @@ class OcrCell {
   /// Keyed by language ("urdu", "arabic").
   final Map<String, EngineCandidate> candidates;
 
+  /// OCR text before Gemini's visual correction (empty if it did not run).
+  final String rawText;
+
   /// True once the backend has read this cell.
   bool get isRead => candidates.isNotEmpty;
+
+  /// True if Gemini changed the OCR text of this box.
+  bool get isAiCorrected => rawText.isNotEmpty && rawText != text;
 }
 
 /// Cells on one printed line, in right-to-left reading order.
@@ -190,6 +199,7 @@ class OcrResult {
     required this.formattedText,
     required this.processingMs,
     required this.totalCells,
+    this.aiCorrection = 'off',
   });
 
   factory OcrResult.fromJson(Map<String, dynamic> json) {
@@ -207,6 +217,7 @@ class OcrResult {
       blocks: blocks,
       formattedText: json['formatted_text'] as String? ?? '',
       processingMs: json['processing_ms'] as int? ?? 0,
+      aiCorrection: json['ai_correction'] as String? ?? 'off',
       totalCells: json['total_cells'] as int? ??
           blocks.fold<int>(0, (n, b) => n + b.rows.fold<int>(0, (m, r) => m + r.cells.length)),
     );
@@ -225,6 +236,9 @@ class OcrResult {
   /// Final page text from the backend (empty while streaming).
   final String formattedText;
   final int processingMs;
+
+  /// Gemini model that inspected the boxes, "off", or `failed: <reason>`.
+  final String aiCorrection;
   final int totalCells;
 
   Iterable<OcrCell> get cells => blocks.expand((b) => b.rows).expand((r) => r.cells);
@@ -261,6 +275,13 @@ class CellEvent extends OcrEvent {
   const CellEvent(this.block, this.row, this.index, this.cell);
   final int block, row, index;
   final OcrCell cell;
+}
+
+/// The server moved to another stage; "ai_correction" = Gemini is
+/// inspecting the boxes.
+class StatusEvent extends OcrEvent {
+  const StatusEvent(this.stage);
+  final String stage;
 }
 
 /// Whole page finished (noise removed, bullets marked, final text).
@@ -315,9 +336,11 @@ class ApiService {
     }
   }
 
-  Future<http.StreamedResponse> _post(String path, File image, String language) async {
+  Future<http.StreamedResponse> _post(
+      String path, File image, String language, bool aiCorrect) async {
     final request = http.MultipartRequest('POST', Uri.parse('$baseUrl$path'))
       ..fields['language'] = language
+      ..fields['ai_correct'] = aiCorrect.toString()
       ..files.add(await http.MultipartFile.fromPath('file', image.path));
     try {
       final response = await _client.send(request).timeout(const Duration(seconds: 60));
@@ -339,9 +362,11 @@ class ApiService {
   /// them, in reading order.
   ///
   /// [language]: "mixed" (both engines + confidence router), "urdu" (UTRNet
-  /// only) or "arabic" (PaddleOCR only).
-  Stream<OcrEvent> scanStream(File image, {String language = 'mixed'}) async* {
-    final response = await _post('/api/v1/ocr/stream', image, language);
+  /// only) or "arabic" (PaddleOCR only). [aiCorrect]: Gemini inspects every
+  /// box crop against its OCR text and fixes it (server needs a Gemini key).
+  Stream<OcrEvent> scanStream(File image,
+      {String language = 'mixed', bool aiCorrect = true}) async* {
+    final response = await _post('/api/v1/ocr/stream', image, language, aiCorrect);
     final lines = response.stream
         .transform(utf8.decoder) // Urdu/Arabic: always decode as UTF-8
         .transform(const LineSplitter())
@@ -359,6 +384,8 @@ class ApiService {
           case 'cell':
             yield CellEvent(json['block'] as int, json['row'] as int, json['cell'] as int,
                 OcrCell.fromJson(json));
+          case 'status':
+            yield StatusEvent(json['stage'] as String? ?? '');
           case 'done':
             yield DoneEvent(OcrResult.fromJson(json));
           case 'error':
@@ -371,8 +398,9 @@ class ApiService {
   }
 
   /// Non-streaming variant: returns the finished page.
-  Future<OcrResult> scanImage(File image, {String language = 'mixed'}) async {
-    final response = await _post('/api/v1/ocr', image, language);
+  Future<OcrResult> scanImage(File image,
+      {String language = 'mixed', bool aiCorrect = true}) async {
+    final response = await _post('/api/v1/ocr', image, language, aiCorrect);
     final body = await response.stream.bytesToString().timeout(timeout);
     try {
       return OcrResult.fromJson(jsonDecode(body) as Map<String, dynamic>);

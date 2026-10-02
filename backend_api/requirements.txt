@@ -36,3 +36,7 @@ lmdb==2.3.0                       # imported by UTRNet/dataset.py
 six==1.17.0                       # imported by UTRNet/dataset.py
 pytz==2026.4                      # imported by UTRNet/utils.py
 matplotlib==3.11.2                # imported by UTRNet/utils.py
+
+# --- Gemini vision correction (ocr_pipeline.GeminiVisionCorrector) ---
+python-dotenv==1.2.3              # loads GEMINI_API_KEY from backend_api/.env
+requests==2.34.2                  # Gemini REST API
