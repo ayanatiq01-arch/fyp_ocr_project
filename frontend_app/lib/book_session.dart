@@ -38,9 +38,6 @@ class BookPage {
   String get header => '=== Page $number ===';
 }
 
-/// Low-confidence threshold (0-100) below which words are highlighted for review.
-const double kLowConfidence = 70;
-
 class BookSession extends ChangeNotifier {
   final List<BookPage> _pages = [];
   OcrLanguage _language = OcrLanguage.mixed;
@@ -89,9 +86,9 @@ class BookSession extends ChangeNotifier {
   String get masterText =>
       _pages.map((p) => '${p.header}\n${p.text}').join('\n\n');
 
-  /// Number of words (cells) read with confidence below [kLowConfidence].
-  int get lowConfidenceCount => _pages
+  /// Number of words (cells) read with confidence below [threshold] (0-100).
+  int lowConfidenceCount(double threshold) => _pages
       .expand((p) => p.result.cells)
-      .where((c) => c.isRead && c.text.isNotEmpty && c.confidence < kLowConfidence)
+      .where((c) => c.isRead && c.text.isNotEmpty && c.confidence < threshold)
       .length;
 }

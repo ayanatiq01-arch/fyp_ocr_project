@@ -27,13 +27,24 @@ void main() {
     expect('<w:br w:type="page"/>'.allMatches(xml).length, 1);
   });
 
-  test('PDF is produced with the bundled Arabic-script font', () async {
-    final regular = File('assets/fonts/NotoNaskhArabic-Regular.ttf').readAsBytesSync();
-    final bold = File('assets/fonts/NotoNaskhArabic-Bold.ttf').readAsBytesSync();
+  // Like rootBundle.load() on a phone: the font is a view at a non-zero
+  // offset inside a larger buffer (used to throw RangeError on export).
+  ByteData fontView(String name) {
+    final bytes = File('assets/fonts/$name').readAsBytesSync();
+    final padded = Uint8List(bytes.length + 64)..setRange(64, 64 + bytes.length, bytes);
+    return ByteData.sublistView(padded, 64);
+  }
+
+  test('PDF is produced from real OCR pages with the bundled font', () async {
+    final pages = [
+      ..._pages,
+      ExportPage('=== Page 3 ===', File('test/fixtures/real_page_urdu.txt').readAsStringSync()),
+      ExportPage('=== Page 4 ===', File('test/fixtures/real_page_bullets.txt').readAsStringSync()),
+    ];
     final pdf = await buildBookPdf(
-      _pages,
-      regularFont: ByteData.sublistView(Uint8List.fromList(regular)),
-      boldFont: ByteData.sublistView(Uint8List.fromList(bold)),
+      pages,
+      regularFont: fontView('NotoNaskhArabic-Regular.ttf'),
+      boldFont: fontView('NotoNaskhArabic-Bold.ttf'),
     );
     expect(String.fromCharCodes(pdf.take(5)), '%PDF-');
     expect(pdf.length, greaterThan(1000));

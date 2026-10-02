@@ -99,6 +99,66 @@ TextStyle scriptStyle(String language, {double size = 20, Color? color}) {
       : GoogleFonts.notoNastaliqUrdu(fontSize: size * 0.9, height: 2.2, color: c);
 }
 
+/// Gold "ح" (Harf) medallion with the HarfScan wordmark.
+class HarfLogo extends StatelessWidget {
+  const HarfLogo({super.key, this.size = 92, this.showTagline = true});
+
+  final double size;
+  final bool showTagline;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: size,
+          height: size,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: HarfColors.goldSheen,
+            boxShadow: [BoxShadow(color: HarfColors.gold.withValues(alpha: 0.35), blurRadius: 24)],
+          ),
+          alignment: Alignment.center,
+          child: Text('ح',
+              style: GoogleFonts.notoNaskhArabic(
+                  fontSize: size * 0.5, fontWeight: FontWeight.w700, color: HarfColors.navy, height: 1.2)),
+        ),
+        SizedBox(height: size * 0.15),
+        ShaderMask(
+          shaderCallback: HarfColors.goldSheen.createShader,
+          child: Text('HarfScan',
+              style: GoogleFonts.cinzel(
+                  fontSize: size * 0.39, fontWeight: FontWeight.w700, color: Colors.white, letterSpacing: 2)),
+        ),
+        if (showTagline) ...[
+          const SizedBox(height: 4),
+          Text('Urdu & Arabic OCR for historical books',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodyMedium
+                  ?.copyWith(color: HarfColors.ink.withValues(alpha: 0.75))),
+        ],
+      ],
+    );
+  }
+}
+
+/// Small gold section caption ("ADD A PAGE").
+class SectionLabel extends StatelessWidget {
+  const SectionLabel(this.text, {super.key});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.only(left: 4, bottom: 10),
+        child: Text(text.toUpperCase(),
+            style: const TextStyle(
+                color: HarfColors.gold, fontSize: 12, letterSpacing: 1.6, fontWeight: FontWeight.w600)),
+      );
+}
+
 /// Full-screen gradient background used by every screen.
 class HarfBackground extends StatelessWidget {
   const HarfBackground({super.key, required this.child});

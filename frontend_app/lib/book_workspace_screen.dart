@@ -8,7 +8,8 @@
 //     === Page 2 ===
 //     [text] ...
 //
-// Words read with confidence < 70 % are highlighted in gold for review.
+// Words read with low confidence (threshold in Settings) are highlighted in
+// gold for review.
 // "Scan Next Page" adds the next page; the toolbar exports the whole book.
 
 import 'package:flutter/material.dart';
@@ -16,16 +17,17 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'api_service.dart';
+import 'app_settings.dart';
 import 'book_session.dart';
-import 'crop_screen.dart';
+import 'select_text_screen.dart';
 import 'export_service.dart';
 import 'theme.dart';
 
 class BookWorkspaceScreen extends StatefulWidget {
-  const BookWorkspaceScreen({super.key, required this.session, required this.api});
+  const BookWorkspaceScreen({super.key, required this.session, required this.settings});
 
   final BookSession session;
-  final ApiService api;
+  final AppSettings settings;
 
   @override
   State<BookWorkspaceScreen> createState() => _BookWorkspaceScreenState();
@@ -65,7 +67,8 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
       ),
     );
     if (source == null || !mounted) return;
-    await CropScreen.pickAndExtract(context, source: source, session: _session, api: widget.api);
+    await SelectTextScreen.pickAndSelect(context,
+        source: source, session: _session, settings: widget.settings);
   }
 
   Future<void> _export(ExportFormat format) async {
@@ -103,7 +106,7 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: _session,
+      listenable: Listenable.merge([_session, widget.settings]),
       builder: (context, _) => Scaffold(
         extendBodyBehindAppBar: true,
         appBar: AppBar(
@@ -160,22 +163,24 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
       );
 
   Widget _buildPages() {
-    final low = _session.lowConfidenceCount;
+    final s = widget.settings;
+    final low = s.highlightLowConfidence ? _session.lowConfidenceCount(s.lowConfidenceThreshold) : 0;
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 96),
       children: [
-        if (low > 0) _ReviewLegend(count: low),
+        if (low > 0) _ReviewLegend(count: low, threshold: s.lowConfidenceThreshold),
         for (final page in _session.pages)
-          _PageCard(page: page, onRemove: () => _confirmRemove(page)),
+          _PageCard(page: page, isLow: s.isLowConfidence, onRemove: () => _confirmRemove(page)),
       ],
     );
   }
 }
 
 class _ReviewLegend extends StatelessWidget {
-  const _ReviewLegend({required this.count});
+  const _ReviewLegend({required this.count, required this.threshold});
 
   final int count;
+  final double threshold;
 
   @override
   Widget build(BuildContext context) {
@@ -192,7 +197,7 @@ class _ReviewLegend extends StatelessWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-                '$count word(s) read with < ${kLowConfidence.toInt()}% confidence - please review',
+                '$count word(s) read with < ${threshold.round()}% confidence - please review',
                 style: Theme.of(context).textTheme.bodySmall),
           ),
         ],
@@ -204,9 +209,10 @@ class _ReviewLegend extends StatelessWidget {
 /// One page of the master document: "=== Page N ===" + its text, laid out
 /// like the printed page (title, paragraphs, bullets, table columns).
 class _PageCard extends StatelessWidget {
-  const _PageCard({required this.page, required this.onRemove});
+  const _PageCard({required this.page, required this.isLow, required this.onRemove});
 
   final BookPage page;
+  final bool Function(double confidence) isLow;
   final VoidCallback onRemove;
 
   @override
@@ -254,7 +260,7 @@ class _PageCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     for (final block in blocks) ...[
-                      _BlockView(block: block),
+                      _BlockView(block: block, isLow: isLow),
                       const SizedBox(height: 12),
                     ],
                   ],
@@ -268,9 +274,10 @@ class _PageCard extends StatelessWidget {
 }
 
 class _BlockView extends StatelessWidget {
-  const _BlockView({required this.block});
+  const _BlockView({required this.block, required this.isLow});
 
   final OcrBlock block;
+  final bool Function(double confidence) isLow;
 
   @override
   Widget build(BuildContext context) {
@@ -288,7 +295,7 @@ class _BlockView extends StatelessWidget {
               for (var i = 0; i < row.cells.length; i++) ...[
                 if (block.isTable && i > 0)
                   const Text('|', style: TextStyle(color: HarfColors.gold)),
-                _Word(cell: row.cells[i], bold: title),
+                _Word(cell: row.cells[i], bold: title, isLow: isLow),
               ],
             ],
           ),
@@ -299,15 +306,16 @@ class _BlockView extends StatelessWidget {
 
 /// A recognised word / box. Low-confidence words get a gold background.
 class _Word extends StatelessWidget {
-  const _Word({required this.cell, required this.bold});
+  const _Word({required this.cell, required this.bold, required this.isLow});
 
   final OcrCell cell;
   final bool bold;
+  final bool Function(double confidence) isLow;
 
   @override
   Widget build(BuildContext context) {
     if (cell.text.isEmpty) return const SizedBox.shrink();
-    final low = cell.confidence < kLowConfidence;
+    final low = isLow(cell.confidence);
     final style = scriptStyle(cell.language, size: bold ? 22 : 19)
         .copyWith(fontWeight: bold ? FontWeight.w700 : FontWeight.w400);
     return Tooltip(

@@ -38,13 +38,20 @@ String _displayLine(String line) => line.replaceAll('\t', '   |   ');
 // PDF
 // --------------------------------------------------------------------------
 
+/// Copies [data] into its own buffer starting at offset 0. On a phone,
+/// rootBundle.load() returns a view into a larger buffer, and the pdf
+/// package's TTF parser reads `data.buffer` ignoring `offsetInBytes`, which
+/// threw a RangeError on export.
+ByteData _ownBuffer(ByteData data) => ByteData.sublistView(Uint8List.fromList(
+    data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes)));
+
 /// Builds the book PDF. [regularFont] / [boldFont] must cover Arabic-script
 /// glyphs (Noto Naskh Arabic is bundled); the pdf package shapes Arabic and
 /// Urdu letters and lays the lines out right-to-left.
 Future<Uint8List> buildBookPdf(List<ExportPage> pages,
     {required ByteData regularFont, required ByteData boldFont, String title = 'HarfScan Book'}) {
-  final regular = pw.Font.ttf(regularFont);
-  final bold = pw.Font.ttf(boldFont);
+  final regular = pw.Font.ttf(_ownBuffer(regularFont));
+  final bold = pw.Font.ttf(_ownBuffer(boldFont));
   final doc = pw.Document(
     title: title,
     creator: 'HarfScan',
