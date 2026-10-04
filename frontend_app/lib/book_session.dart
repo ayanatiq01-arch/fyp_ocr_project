@@ -86,10 +86,6 @@ class BookSession extends ChangeNotifier {
   String get masterText =>
       _pages.map((p) => '${p.header}\n${p.text}').join('\n\n');
 
-  /// Number of boxes whose OCR text Gemini corrected.
-  int get aiCorrectedCount =>
-      _pages.expand((p) => p.result.cells).where((c) => c.isAiCorrected).length;
-
   /// Number of words (cells) read with confidence below [threshold] (0-100).
   int lowConfidenceCount(double threshold) => _pages
       .expand((p) => p.result.cells)

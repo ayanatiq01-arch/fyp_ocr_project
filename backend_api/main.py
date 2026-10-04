@@ -81,8 +81,6 @@ class CellOut(BaseModel):
     confidence: float = Field(..., description="0-100, of the accepted engine")
     candidates: Dict[str, Candidate] = Field(
         default_factory=dict, description="Both engines' raw results, keyed by language")
-    raw_text: str = Field("", description="OCR text before Gemini correction "
-                                          "(empty when AI correction did not run)")
 
 
 class RowOut(BaseModel):
@@ -131,8 +129,9 @@ class OcrResponse(BaseModel):
     formatted_text: str = Field(..., description="Page text: blank line between blocks, "
                                                  "TAB between table columns, '• ' bullets")
     processing_ms: int
-    ai_correction: str = Field("off", description="Gemini model that inspected the boxes, "
-                                                  "'off', or 'failed: <reason>'")
+    ai_correction: str = Field("off", description="Gemini model that read the page, 'off' "
+                                                  "(local OCR), or 'failed: <reason>' (local OCR "
+                                                  "used because Gemini was unavailable)")
 
 
 def _pct(x: float) -> float:
@@ -149,7 +148,6 @@ def cell_out(pre: ip.PreprocessResult, cell: Cell) -> CellOut:
         confidence=_pct(cell.confidence),
         candidates={lang: Candidate(text=c.text, confidence=_pct(c.confidence))
                     for lang, c in cell.candidates.items()},
-        raw_text=cell.raw_text,
     )
 
 
@@ -263,8 +261,8 @@ def _read_upload(file: UploadFile) -> tuple[str, Path, np.ndarray]:
 
 LANGUAGE_HELP = ("mixed = both engines + confidence router (default); "
                  "urdu = UTRNet only; arabic = PaddleOCR only")
-AI_HELP = ("true = Gemini visually inspects every box crop against its OCR text and "
-           "fixes spelling / spacing (needs GEMINI_API_KEY)")
+AI_HELP = ("true = Gemini reads the page (text, boxes and layout); falls back to the "
+           "local OCR engines if Gemini is unavailable (needs GEMINI_API_KEY)")
 
 
 def _check_language(language: str) -> None:

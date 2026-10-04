@@ -59,16 +59,15 @@ void main() {
     api.dispose();
   });
 
-  test('Gemini: corrected boxes keep the OCR reading in raw_text', () {
-    final fixed = OcrCell.fromJson(
-        {'bbox': [0, 0, 10, 10], 'text': 'برصغیر کی', 'raw_text': 'برصغیرکی', 'confidence': 62.5});
-    expect(fixed.isAiCorrected, isTrue);
-    expect(fixed.rawText, 'برصغیرکی');
-
-    final same = OcrCell.fromJson(
-        {'bbox': [0, 0, 10, 10], 'text': 'اردو', 'raw_text': 'اردو', 'confidence': 90});
-    final oldServer = OcrCell.fromJson({'bbox': [0, 0, 10, 10], 'text': 'اردو', 'confidence': 90});
-    expect(same.isAiCorrected, isFalse);
-    expect(oldServer.isAiCorrected, isFalse);
+  test('Page source: Gemini vs local OCR', () {
+    OcrResult page(String ai) => OcrResult.fromJson({
+          'image': {'width': 10, 'height': 10},
+          'blocks': [],
+          'ai_correction': ai,
+        });
+    expect(page('gemini-3.6-flash').readByGemini, isTrue);
+    expect(page('off').readByGemini, isFalse);
+    expect(page('failed: no Gemini model available').readByGemini, isFalse);
+    expect(OcrResult.fromJson({'image': {'width': 1, 'height': 1}}).aiCorrection, 'off');
   });
 }

@@ -180,9 +180,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onChanged: (v) => _settings.aiCorrect = v,
               activeThumbColor: HarfColors.gold,
               secondary: const Icon(Icons.auto_awesome, color: HarfColors.gold),
-              title: const Text('Gemini AI correction'),
-              subtitle: const Text('Gemini looks at each text box image, compares it with the '
-                  'OCR text and fixes spelling and spacing (needs internet on the server)'),
+              title: const Text('Gemini AI reading'),
+              subtitle: const Text('Gemini reads the whole page: text, line boxes and layout '
+                  '(needs internet on the server). Off, or if Gemini is unavailable: '
+                  'UTRNet + PaddleOCR on the server'),
             ),
             const Divider(height: 1),
             SwitchListTile(
@@ -232,14 +233,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 'Arabic: PaddleOCR PP-OCRv5 Arabic',
                 'Text detection: PaddleOCR PP-OCRv5',
                 'Layout: LayoutParser + confidence routing',
-                'AI check: Google Gemini Flash (vision)',
+                'AI reading: Google Gemini Flash (vision)',
               ])
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
                   child: Text('• $line', style: Theme.of(context).textTheme.bodySmall),
                 ),
               const SizedBox(height: 8),
-              Text('Version 2.3.0', style: Theme.of(context).textTheme.bodySmall),
+              Text('Version 2.4.0', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ),

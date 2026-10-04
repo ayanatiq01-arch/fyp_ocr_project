@@ -72,7 +72,6 @@ class OcrCell {
     required this.engine,
     required this.confidence,
     required this.candidates,
-    this.rawText = '',
   });
 
   factory OcrCell.fromJson(Map<String, dynamic> json) => OcrCell(
@@ -85,7 +84,6 @@ class OcrCell {
         candidates: (json['candidates'] as Map<String, dynamic>? ?? {}).map(
           (k, v) => MapEntry(k, EngineCandidate.fromJson(v as Map<String, dynamic>)),
         ),
-        rawText: json['raw_text'] as String? ?? '',
       );
 
   final BBox bbox;
@@ -106,14 +104,8 @@ class OcrCell {
   /// Keyed by language ("urdu", "arabic").
   final Map<String, EngineCandidate> candidates;
 
-  /// OCR text before Gemini's visual correction (empty if it did not run).
-  final String rawText;
-
   /// True once the backend has read this cell.
   bool get isRead => candidates.isNotEmpty;
-
-  /// True if Gemini changed the OCR text of this box.
-  bool get isAiCorrected => rawText.isNotEmpty && rawText != text;
 }
 
 /// Cells on one printed line, in right-to-left reading order.
@@ -237,8 +229,13 @@ class OcrResult {
   final String formattedText;
   final int processingMs;
 
-  /// Gemini model that inspected the boxes, "off", or `failed: <reason>`.
+  /// Gemini model that read the page, "off" (local OCR), or
+  /// `failed: <reason>` (local OCR used because Gemini was unavailable).
   final String aiCorrection;
+
+  /// True if the page was read by Gemini (not the local OCR engines).
+  bool get readByGemini => aiCorrection.startsWith('gemini');
+
   final int totalCells;
 
   Iterable<OcrCell> get cells => blocks.expand((b) => b.rows).expand((r) => r.cells);
@@ -277,8 +274,8 @@ class CellEvent extends OcrEvent {
   final OcrCell cell;
 }
 
-/// The server moved to another stage; "ai_correction" = Gemini is
-/// inspecting the boxes.
+/// The server moved to another stage: "ai_reading" = Gemini is reading the
+/// page; "local_ocr" = Gemini was unavailable, the local engines read it.
 class StatusEvent extends OcrEvent {
   const StatusEvent(this.stage);
   final String stage;
@@ -362,8 +359,8 @@ class ApiService {
   /// them, in reading order.
   ///
   /// [language]: "mixed" (both engines + confidence router), "urdu" (UTRNet
-  /// only) or "arabic" (PaddleOCR only). [aiCorrect]: Gemini inspects every
-  /// box crop against its OCR text and fixes it (server needs a Gemini key).
+  /// only) or "arabic" (PaddleOCR only). [aiCorrect]: Gemini reads the page
+  /// (text, boxes and layout); the server falls back to its local OCR.
   Stream<OcrEvent> scanStream(File image,
       {String language = 'mixed', bool aiCorrect = true}) async* {
     final response = await _post('/api/v1/ocr/stream', image, language, aiCorrect);

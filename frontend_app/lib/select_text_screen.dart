@@ -75,7 +75,7 @@ enum _Phase { reading, selecting, failed }
 class _SelectTextScreenState extends State<SelectTextScreen> {
   StreamSubscription<OcrEvent>? _scan;
   _Phase _phase = _Phase.reading;
-  bool _aiChecking = false; // Gemini is inspecting the boxes
+  String _stage = ''; // server stage: 'ai_reading' / 'local_ocr'
   String _error = '';
   OcrResult? _result;
   List<_Word> _words = const [];
@@ -111,7 +111,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       _result = null;
       _words = const [];
       _anchor = _focus = null;
-      _aiChecking = false;
+      _stage = '';
     });
     _scan = widget.settings.api
         .scanStream(widget.image,
@@ -130,7 +130,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
                 if (index < cells.length) cells[index] = cell;
               }
             case StatusEvent(:final stage):
-              _aiChecking = stage == 'ai_correction';
+              _stage = stage;
             case DoneEvent(:final result):
               _result = result;
               _words = _buildWords(result);
@@ -174,9 +174,11 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
   }
 
   static List<Rect> _splitBox(Rect box, List<String> parts, int rotation) {
-    // A sideways photo (90/270): text runs vertically in the photo - keep the
-    // whole box for each word rather than guessing.
-    if (parts.length == 1 || rotation % 180 != 0) return [for (final _ in parts) box];
+    // A sideways photo (90/270, or a tall line box from Gemini, which reads
+    // the photo as it is): text runs vertically - keep the whole box for each
+    // word rather than guessing.
+    final vertical = rotation % 180 != 0 || (parts.length > 1 && box.height > box.width * 1.5);
+    if (parts.length == 1 || vertical) return [for (final _ in parts) box];
     final total = parts.fold<int>(0, (n, p) => n + p.length) + parts.length - 1;
     final rects = <Rect>[];
     var cum = 0;
@@ -467,16 +469,18 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       mainAxisSize: MainAxisSize.min,
       children: [
         LinearProgressIndicator(
-          value: total == 0 || _aiChecking ? null : read / total,
+          value: total == 0 || _stage == 'ai_reading' ? null : read / total,
           color: HarfColors.brightGold,
           backgroundColor: HarfColors.slate,
           minHeight: 6,
           borderRadius: BorderRadius.circular(3),
         ),
         const SizedBox(height: 10),
-        Text(_aiChecking
-            ? 'Gemini AI is checking the text against the image...'
-            : total == 0
+        Text(_stage == 'ai_reading'
+            ? 'Gemini AI is reading the page...'
+            : total == 0 && _stage == 'local_ocr'
+                ? 'Gemini unavailable - reading with the local OCR...'
+                : total == 0
                 ? 'Finding text on the page...'
                 : 'Reading ${widget.session.language.label} text  $read / $total'),
         const SizedBox(height: 4),

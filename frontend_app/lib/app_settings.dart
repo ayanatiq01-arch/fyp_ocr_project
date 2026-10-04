@@ -2,7 +2,7 @@
 //
 // User settings, remembered between app launches (shared_preferences):
 // backend server URL, low-confidence review threshold and highlighting,
-// Gemini AI correction.
+// Gemini AI page reading.
 // Also owns the ApiService for the current server URL.
 
 import 'package:flutter/foundation.dart';
@@ -45,7 +45,7 @@ class AppSettings extends ChangeNotifier {
   double get lowConfidenceThreshold => _threshold;
   bool get highlightLowConfidence => _highlight;
 
-  /// Ask the server to let Gemini visually check and correct the OCR text.
+  /// Ask the server to read pages with Gemini (falls back to local OCR).
   bool get aiCorrect => _aiCorrect;
 
   set aiCorrect(bool value) {

@@ -3,32 +3,34 @@
 | File | Purpose |
 |---|---|
 | `main.py` | FastAPI app: `POST /api/v1/ocr/stream` (live NDJSON), `POST /api/v1/ocr`, `GET /health` |
-| `ocr_pipeline.py` | Auto-crop (text detection) → rows/blocks/tables → UTRNet ‖ PaddleOCR → **confidence router** → **Gemini vision check** |
+| `ocr_pipeline.py` | **Gemini page reading** (text + boxes + layout); fallback: auto-crop (text detection) → rows/blocks/tables → UTRNet ‖ PaddleOCR → **confidence router** |
 | `.env` | `GEMINI_API_KEY=...` (git-ignored, never committed) |
-| `test_gemini_corrector.py` | Unit tests for the Gemini step, no network needed (`venv\Scripts\python -m unittest test_gemini_corrector -v`) |
+| `test_gemini_reader.py` | Unit tests for Gemini page reading, no network needed (`venv\Scripts\python -m unittest test_gemini_reader -v`) |
 | `image_processing.py` | OpenCV: 90°/180°/270° page orientation, deskew, shadow removal, adaptive binarisation, denoise, line segmentation |
 | `UTRNet-High-Resolution-Urdu-Text-Recognition/` | Cloned UTRNet repo + `saved_models/UTRNet-Large/best_norm_ED.pth` |
 | `temp_uploads/` | Uploads are stored here while they are processed, then deleted (`KEEP_UPLOADS=1` keeps them) |
 
 ## How a page is processed
 
+**Main path: Gemini page reading** (when `GEMINI_API_KEY` is set and the request has `ai_correct=true`).
+- The whole photo goes to Google Gemini Flash (vision) in **one request**, resized to at most 2000 px with high media resolution.
+- Gemini returns JSON: blocks in reading order (Title / Text / List / Table), each printed line as a row, and table rows split into cells (column 0 = right-most). Every line or cell comes with its **bounding box** and its text exactly as printed, with harakat, digits and punctuation.
+- Text, boxes and format therefore come from the same model, so a line is never cut in half. It also works on tilted, sideways or upside-down photos and on low-quality images (see the results below).
+- The free tier allows about 20 requests per day per model. When a model's daily quota is used up, or the model is overloaded, the next model in `GEMINI_MODELS` takes over.
+
+**Fallback: local OCR.** Used when Gemini is off or unavailable (no key, no internet, quota used up for every model):
+
 1. **Orientation and cleaning.** The page is turned upright (0/90/180/270°) and straightened by up to ±15°. Shadows are removed, and the page is denoised and binarised.
-2. **Auto-crop.** PaddleOCR's text detector (`PP-OCRv5_mobile_det`) finds every text line and table cell, so the user photographs the whole page and never crops by hand. Any ink the detector misses is picked up by an OpenCV fallback.
+2. **Auto-crop.** PaddleOCR's text detector (`PP-OCRv5_mobile_det`) finds every text line and table cell. Any ink the detector misses is picked up by an OpenCV fallback.
 3. **Layout.**
    - Boxes are chained into rows, each box to its nearest neighbour on the left. This keeps rows intact on curved pages.
    - Rows are grouped into blocks wherever the vertical gap is less than 0.8 line heights.
    - A block becomes a **Table** when most of its rows have column-sized gaps. Columns are found from the right-aligned edges.
    - A lone centred line becomes a **Title**. LayoutParser adds Title and List hints in the background.
 4. **Routing.** Every box goes to **UTRNet** and **PaddleOCR** at the same time. The higher confidence wins; the other result is discarded.
-5. **AI vision inspection (Gemini Flash).** After the page is read, every box is sent to Google Gemini: the **cropped image of the box together with its raw OCR text**.
-   - Gemini compares the two and returns the text exactly as printed: spelling, dots, and missing or extra spaces between words are fixed.
-   - The prompt forbids translating, modernising or adding text.
-   - The answer is JSON (one entry per box number), so the layout stays intact.
-   - Boxes go in batches of 20, sent in parallel.
-   - A box is rejected, and its OCR text kept, if Gemini's answer is empty, contains English, or shares less than 65 % with the OCR text. The last case means Gemini rewrote the text instead of correcting it.
-   - If Gemini fails, the OCR text is kept and the scan still completes. Failures include no key, no internet, quota used up, or a timeout.
-   - The OCR reading is kept as `raw_text`, so the app can show what was changed.
-6. **Output.** Results are streamed in reading order as they are ready. At the end, page ornaments are removed and bullets are marked. The formatted text keeps the page structure: a blank line between blocks, TAB between table columns, and `• ` for bullets.
+5. **Output.** Results are streamed in reading order as they are ready. At the end, page ornaments are removed and bullets are marked.
+
+In both cases the formatted text keeps the page structure: a blank line between blocks, TAB between table columns, and `• ` for bullets.
 
 ## Setup (Windows, Python 3.11)
 
@@ -62,7 +64,7 @@ Form fields of both OCR endpoints:
 |---|---|---|
 | `file` | — | the page photo (JPEG/PNG/HEIC …) |
 | `language` | `mixed` | `mixed` = both engines + confidence router; `urdu` = UTRNet only; `arabic` = PaddleOCR only (faster) |
-| `ai_correct` | `true` | Gemini vision inspection of every box (needs `GEMINI_API_KEY` in `.env`) |
+| `ai_correct` | `true` | Read the page with Gemini (needs `GEMINI_API_KEY` in `.env`); `false` = local OCR only |
 
 ### Gemini API key
 
@@ -72,7 +74,7 @@ Put the key in `backend_api/.env`, which git ignores:
 GEMINI_API_KEY=your-key
 ```
 
-The free tier allows about **20 requests per day for each model**. A page uses one request per 20 boxes. When a model's daily quota is used up, or the model is overloaded, the next model in `GEMINI_MODELS` takes over.
+The free tier allows about **20 requests per day for each model**, and each page uses one request. With the five default models that is about 100 pages a day. After that the server reads pages with the local OCR until the quota resets.
 
 ## Response (abridged)
 
@@ -86,7 +88,7 @@ The free tier allows about **20 requests per day for each model**. A page uses o
                "cells": [{"bbox": [1449, 391, 1648, 505], "column": 0, "text": "سَمعَ",
                           "language": "urdu", "engine": "UTRNet", "confidence": 99.5,
                           "candidates": {"urdu": {...}, "arabic": {...}},
-                          "raw_text": "سَمعَ"}, ...]}]}
+                          }, ...]}]}
   ],
   "formatted_text": "…",
   "processing_ms": 80269,
@@ -94,7 +96,9 @@ The free tier allows about **20 requests per day for each model**. A page uses o
 }
 ```
 
-The stream sends a `layout` event first (all boxes, no text), then one `cell` event per box in reading order with the raw OCR text. Next comes `{"event": "status", "stage": "ai_correction"}` while Gemini checks the boxes, then `done` with the object above. `ai_correction` is the Gemini model that answered, `off`, or `failed: <reason>`. All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image.
+With Gemini, the stream sends `{"event": "status", "stage": "ai_reading"}`, then `layout` (the whole page, already read), then `done`. With local OCR, it sends `layout` first (all boxes, no text), then one `cell` event per box in reading order, then `done`. If Gemini fails, a `{"stage": "local_ocr"}` status comes before the local events.
+
+`ai_correction` is the Gemini model that read the page, `off`, or `failed: <reason>` (local OCR was used). Cells read by Gemini have `engine: "Gemini"` and a fixed confidence of 99, because Gemini gives no per-word score. All boxes are `[x1, y1, x2, y2]` in pixels of the **uploaded** image.
 
 ## Configuration (environment variables)
 
@@ -105,13 +109,12 @@ The stream sends a `layout` event first (all boxes, no text), then one `cell` ev
 | `MIN_TEXT_CONFIDENCE` | `0.5` | Boxes that neither engine reads above this are dropped as ornaments or noise |
 | `TORCH_THREADS` / `OCR_CPU_THREADS` | all cores / half | CPU threads for UTRNet / Paddle |
 | `PADDLE_ARABIC_MODEL` / `PADDLE_DET_MODEL` | `arabic_PP-OCRv5_mobile_rec` / `PP-OCRv5_mobile_det` | PaddleOCR 3.x model names |
-| `GEMINI_API_KEY` | — | Google AI Studio key; without it the Gemini step is skipped |
-| `GEMINI_CORRECTION` | `1` | `0` switches the Gemini step off for every request |
+| `GEMINI_API_KEY` | — | Google AI Studio key; without it pages are read by the local OCR |
+| `GEMINI_CORRECTION` | `1` | `0` switches Gemini off for every request |
 | `GEMINI_MODELS` | `gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview` | Flash models tried in order (Gemini 1.5 Flash is retired) |
-| `GEMINI_BATCH` | `20` | Boxes per request (requests of one page run in parallel) |
-| `GEMINI_THINKING` | `low` | Gemini 3 thinking level; `high` was more accurate on the table page (CER 0.30 % vs 1.52 %) but about 3× slower |
+| `GEMINI_MAX_SIDE` | `2000` | Long side (px) of the photo sent to Gemini |
+| `GEMINI_THINKING` | `low` | Gemini 3 thinking level |
 | `GEMINI_TIMEOUT` | `240` | Seconds per request |
-| `GEMINI_MIN_SIMILARITY` | `0.65` | Answers sharing less than this with the OCR text are rejected |
 | `MAX_UPLOAD_MB` | `20` | Upload size limit |
 | `KEEP_UPLOADS` | `0` | `1` keeps files in `temp_uploads/` |
 
@@ -124,25 +127,26 @@ The stream sends a `layout` event first (all boxes, no text), then one `cell` ev
 
   UTRNet's HRNet backbone takes about 0.5–1 s per box. Each box is run at its own width (padded to a multiple of 16) instead of the fixed 400 px, which is about 4× faster than in `read.py`. Close other heavy programs, since the models need about 2 GB of RAM. A CUDA GPU (`OCR_DEVICE=gpu`) removes the bottleneck.
 - **Router on Arabic words.** On the test book, UTRNet was *more* confident than PaddleOCR even on Arabic words with harakat. For example, خَلَدَ scored 99.5 % vs 79 %. The text is read correctly, but those words are labelled `urdu`. With the default margin of 0 this follows the specified rule exactly.
-- **Gemini correction: measured gain, and its costs.** Character error rate (CER) on the 6 test pages, from the same OCR run with and without the Gemini step (`GEMINI_THINKING=low`):
+- **Accuracy: Gemini page reading vs local OCR.** Character error rate (CER), letters only, harakat, punctuation and spaces ignored:
 
-  | Page | OCR | + Gemini |
+  | Page | Local OCR | Gemini page reading |
   |---|---|---|
-  | real1 (table) | 2.13 % | 1.52 % |
-  | real2 (table, full photo) | 3.66 % | 1.83 % |
-  | real5 (grammar page) | 1.58 % | 0.59 % |
-  | page_photo | 1.00 % | 1.00 % |
-  | page_photo2 | 0.50 % | 0.00 % |
-  | page_clean | 0.00 % | 0.00 % |
-  | **Average** | **1.48 %** | **0.82 %** |
+  | real1 (table) | 2.13 % | 0.00 % |
+  | real2 (table, book in hand) | 3.66 % | 0.61 % |
+  | real5 (grammar page) | 1.58 % | 0.40 % |
+  | page_photo / page_photo2 / page_clean | 1.00 / 0.50 / 0.00 % | 0.00 / 0.00 / 0.00 % |
+  | real1, degraded (low resolution, blur, noise) | 6.10 % | 0.00 % |
+  | page_photo, degraded | 1.49 % | 0.00 % |
+  | real5, degraded (256 px wide, barely readable) | 48.71 % | 8.12 % |
+  | real5, turned 90° | — | 3.76 % |
+  | page_photo, upside down | — | 0.00 % |
 
-  No page got worse. The costs:
-  - It adds 5–50 s per page.
-  - It needs internet on the server PC.
-  - It sends the page crops to Google.
-  - The free-tier daily quota is small, so with heavy use it falls back to plain OCR.
-
-  Without an image, Gemini rewrote a test sentence into a different one. That is why the image is always sent and the similarity check exists.
+  Line and cell boxes were checked visually on every page, including the sideways one, and fit the printed lines. The costs:
+  - 5–80 s per page, depending on how busy Google's servers are.
+  - The server PC needs internet.
+  - The page photo is sent to Google.
+  - The free-tier daily quota.
+- **Gemini 503 "high demand".** Google's Flash models are often briefly overloaded. Each model is retried once, then the next model is tried. Only when all models fail is the page read locally.
 - **LayoutParser.** The only available Paddle model (PubLayNet) was trained on English research papers and usually finds nothing on Urdu/Arabic pages. So page structure comes from the detected text boxes, and LayoutParser only adds Title/List hints.
 - **Multi-column prose.** Two side-by-side columns of running text are treated as a two-column table. The text is correct, but reading order goes row by row across both columns.
 - **License.** UTRNet code and models are CC BY-NC-SA 4.0, for non-commercial and academic use only.
