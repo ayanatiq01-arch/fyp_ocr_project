@@ -254,7 +254,10 @@ def _read_upload(file: UploadFile) -> tuple[str, Path, np.ndarray]:
     try:
         image = ip.decode_image(data)
     except ValueError as exc:
-        _cleanup(temp_path)
+        # Keep the file for diagnosis (temp_uploads/failed_<id>...).
+        temp_path.rename(temp_path.with_name(f"failed_{temp_path.name}"))
+        logger.warning("upload %s (%s, %d bytes, starts %s, ends %s) not decodable: %s",
+                       request_id, file.filename, len(data), data[:8].hex(), data[-4:].hex(), exc)
         raise HTTPException(400, str(exc)) from exc
     return request_id, temp_path, image
 

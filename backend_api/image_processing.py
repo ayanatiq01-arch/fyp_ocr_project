@@ -36,7 +36,7 @@ from typing import List, Sequence, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,30 @@ def decode_image(data: bytes) -> np.ndarray:
         ValueError: if the bytes are not a readable image.
     """
     try:
-        pil = Image.open(io.BytesIO(data))
-        pil = ImageOps.exif_transpose(pil).convert("RGB")
+        return _decode_pil(data)
     except Exception as exc:  # Pillow raises several exception types
-        raise ValueError(f"Could not decode image: {exc}") from exc
+        first_error = exc
+    # Truncated file (photo not fully saved / synced on the phone, or an
+    # interrupted transfer): decode the part that is there - the missing
+    # bottom rows are grey - instead of rejecting the page.
+    try:
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        image = _decode_pil(data)
+        logger.warning("image is truncated (%d bytes): decoded the available part", len(data))
+        return image
+    except Exception:
+        pass
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)  # last resort
+    if image is not None:
+        return image
+    raise ValueError(f"Could not decode image: {first_error}") from first_error
+
+
+def _decode_pil(data: bytes) -> np.ndarray:
+    pil = Image.open(io.BytesIO(data))
+    pil = ImageOps.exif_transpose(pil).convert("RGB")
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
 
