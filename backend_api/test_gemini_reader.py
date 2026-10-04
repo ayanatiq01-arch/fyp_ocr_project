@@ -7,7 +7,8 @@ import unittest
 
 import numpy as np
 
-from ocr_pipeline import GeminiPageReader, blocks_from_gemini, script_language
+from ocr_pipeline import (GeminiPageReader, blocks_from_gemini, blocks_to_markdown,
+                          md_escape, script_language)
 
 PAGE = {"blocks": [
     {"type": "Title", "rows": [{"cells": [{"box_2d": [10, 300, 50, 700], "text": "اردو  ادب کی"}]}]},
@@ -48,6 +49,27 @@ class BlocksTest(unittest.TestCase):
         self.assertEqual(script_language("پاکستان"), "urdu")
         self.assertEqual(script_language("الحمد لله رب العالمين"), "arabic")
         self.assertEqual(script_language("123"), "unknown")
+
+
+class MarkdownTest(unittest.TestCase):
+    def test_page_structure_becomes_markdown(self):
+        md = blocks_to_markdown(blocks_from_gemini(PAGE, 1000, 1000))
+        self.assertEqual(md, "## اردو ادب کی\n\n"
+                             "| سَمِعَ | اس نے سنا |\n| --- | --- |\n\n"
+                             "- مرزا غالب\n"
+                             "الحمد لله\n")
+
+    def test_lines_keep_hard_breaks(self):
+        page = {"blocks": [{"type": "Text", "rows": [
+            {"cells": [{"box_2d": [0, 0, 10, 10], "text": "پہلی سطر"}]},
+            {"cells": [{"box_2d": [20, 0, 30, 10], "text": "دوسری سطر"}]}]}]}
+        self.assertEqual(blocks_to_markdown(blocks_from_gemini(page, 100, 100)),
+                         "پہلی سطر  \nدوسری سطر\n")
+
+    def test_markdown_characters_are_escaped(self):
+        self.assertEqual(md_escape("# ۱۔ *x* [a]"), r"\# ۱۔ \*x\* \[a\]")
+        self.assertEqual(md_escape("1. y"), r"\1. y")
+        self.assertEqual(md_escape("a | b", table=True), r"a \| b")
 
 
 class FakeResponse:

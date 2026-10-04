@@ -16,19 +16,63 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
+import 'api_service.dart';
 import 'book_session.dart';
 
-/// One page as it is exported: "=== Page N ===" header + text.
-class ExportPage {
-  const ExportPage(this.header, this.text);
+/// One printed line: its cells (one for text lines, one per column for
+/// table rows, column 0 = right-most) and whether it is a bullet item.
+class ExportRow {
+  const ExportRow(this.cells, {this.bullet = false});
 
-  factory ExportPage.of(BookPage page) => ExportPage(page.header, page.text);
+  final List<String> cells;
+  final bool bullet;
+}
+
+/// A layout block of the page: "Title", "Text", "List" or "Table".
+class ExportBlock {
+  const ExportBlock(this.type, this.rows);
+
+  /// The page's blocks with their lines, in reading order.
+  static List<ExportBlock> ofResult(OcrResult result) => [
+        for (final b in result.blocks)
+          ExportBlock(b.type, [
+            for (final r in b.rows)
+              if (r.cells.any((c) => c.text.isNotEmpty))
+                ExportRow(b.isTable ? _tableCells(b, r) : [b.rowText(r)], bullet: r.isBullet),
+          ]),
+      ].where((b) => b.rows.isNotEmpty).toList();
+
+  static List<String> _tableCells(OcrBlock block, OcrRow row) {
+    final slots = List<String>.filled(block.columns < 1 ? 1 : block.columns, '');
+    for (final c in row.cells) {
+      if (c.text.isEmpty || c.column >= slots.length) continue;
+      slots[c.column] = slots[c.column].isEmpty ? c.text : '${slots[c.column]} ${c.text}';
+    }
+    return slots;
+  }
+
+  final String type;
+  final List<ExportRow> rows;
+
+  bool get isTable => type == 'Table';
+}
+
+/// One page as it is exported: "=== Page N ===" header + its content.
+class ExportPage {
+  const ExportPage(this.header, this.text, {this.blocks = const []});
+
+  factory ExportPage.of(BookPage page) =>
+      ExportPage(page.header, page.text, blocks: ExportBlock.ofResult(page.result));
 
   final String header;
 
   /// Page text: one printed line per text line, blank line between blocks,
-  /// TAB between table columns, "• " bullets.
+  /// TAB between table columns, "• " bullets. Used when [blocks] is empty.
   final String text;
+
+  /// The page layout (headings, paragraphs, lists, tables) - exported with
+  /// the same formatting as the printed page.
+  final List<ExportBlock> blocks;
 }
 
 /// Table columns are separated by TAB in the OCR text; shown as " | ".
@@ -88,19 +132,91 @@ Future<Uint8List> buildBookPdf(List<ExportPage> pages,
                 textDirection: pw.TextDirection.ltr,
                 style: pw.TextStyle(color: gold, fontWeight: pw.FontWeight.bold, fontSize: 12)),
           ),
-          for (final line in page.text.split('\n'))
-            line.trim().isEmpty
-                ? pw.SizedBox(height: 8)
-                // "•" is in neither font: use the Arabic star "٭" as the bullet.
-                : pw.Text(_displayLine(line).replaceAll('•', '٭'),
-                    textDirection: pw.TextDirection.rtl,
-                    textAlign: pw.TextAlign.right,
-                    style: const pw.TextStyle(fontSize: 13, lineSpacing: 4)),
+          if (page.blocks.isEmpty)
+            for (final line in page.text.split('\n'))
+              line.trim().isEmpty
+                  ? pw.SizedBox(height: 8)
+                  : _pdfLine(_displayLine(line).replaceAll('•', _pdfBullet))
+          else
+            for (final block in page.blocks) ...[
+              ..._pdfBlock(block),
+              pw.SizedBox(height: 10),
+            ],
         ],
       ],
     ),
   );
   return doc.save();
+}
+
+// "•" is in neither font: the Arabic star "٭" is used as the bullet.
+const _pdfBullet = '٭';
+
+/// U+200F (right-to-left mark) in front of every line: the bidi package used
+/// by pdf throws a RangeError when a line STARTS with a hamza letter and a
+/// diacritic (e.g. "أُرِيدُ", "إِيْمَانٌ"); the invisible mark avoids it.
+const _rlm = '\u200F';
+
+/// The pdf package lays right-to-left lines out without mirroring paired
+/// brackets, so "(۱۹)" came out as ")۱۹(". Swapping them first displays
+/// them the right way round.
+const _mirror = {'(': ')', ')': '(', '[': ']', ']': '[', '{': '}', '}': '{', '<': '>', '>': '<'};
+
+/// The pdf package does not shape Urdu yeh (U+06CC) when a diacritic follows
+/// it inside a word ("ایْمان" lost its dots). In that position Arabic yeh
+/// (U+064A) looks identical, so it is drawn instead.
+final _urduYehBeforeMark = RegExp('\u06CC(?=[\u064B-\u065F\u0670]+[\u0621-\u064A\u0671-\u06D3])');
+
+String _pdfText(String text) => text.isEmpty
+    ? text
+    : '$_rlm${text.replaceAll(_urduYehBeforeMark, '\u064A').split('').map((c) => _mirror[c] ?? c).join()}';
+
+pw.Widget _pdfLine(String text,
+        {double size = 13, bool bold = false, pw.TextAlign align = pw.TextAlign.right}) =>
+    pw.Text(_pdfText(text),
+        textDirection: pw.TextDirection.rtl,
+        textAlign: align,
+        style: pw.TextStyle(
+            fontSize: size, lineSpacing: 4, fontWeight: bold ? pw.FontWeight.bold : null));
+
+/// One block laid out like the printed page.
+List<pw.Widget> _pdfBlock(ExportBlock block) {
+  switch (block.type) {
+    case 'Title':
+      return [
+        for (final r in block.rows)
+          pw.Container(
+            width: double.infinity,
+            alignment: pw.Alignment.center,
+            child: _pdfLine(r.cells.join(' '), size: 17, bold: true, align: pw.TextAlign.center),
+          ),
+      ];
+    case 'Table':
+      final cols = block.rows.fold<int>(1, (n, r) => r.cells.length > n ? r.cells.length : n);
+      return [
+        pw.Table(
+          border: pw.TableBorder.all(color: PdfColors.grey600, width: 0.6),
+          defaultVerticalAlignment: pw.TableCellVerticalAlignment.middle,
+          children: [
+            for (final r in block.rows)
+              pw.TableRow(children: [
+                // Column 0 is the right-most column of the book: PDF tables
+                // are laid out left-to-right, so the cells go in reverse.
+                for (var c = cols - 1; c >= 0; c--)
+                  pw.Padding(
+                    padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                    child: _pdfLine(c < r.cells.length ? r.cells[c] : ''),
+                  ),
+              ]),
+          ],
+        ),
+      ];
+    default: // Text, List: one line per printed line
+      return [
+        for (final r in block.rows)
+          _pdfLine(r.bullet ? '$_pdfBullet ${r.cells.join(' ')}' : r.cells.join(' ')),
+      ];
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -128,14 +244,64 @@ String _headerParagraph(String text) => '<w:p><w:pPr><w:spacing w:before="240" w
 
 const _pageBreak = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
 
+String _run(String text, {int size = 28, bool bold = false}) =>
+    '<w:r><w:rPr><w:rFonts w:ascii="$_font" w:hAnsi="$_font" w:cs="$_font"/>'
+    '${bold ? '<w:b/><w:bCs/>' : ''}<w:rtl/><w:sz w:val="$size"/><w:szCs w:val="$size"/></w:rPr>'
+    '<w:t xml:space="preserve">${_xmlEscape(text)}</w:t></w:r>';
+
+String _titleParagraph(String text) => '<w:p><w:pPr><w:bidi/><w:jc w:val="center"/>'
+    '<w:spacing w:before="120" w:after="120"/></w:pPr>${_run(text, size: 34, bold: true)}</w:p>';
+
+String _cellParagraph(String text) => '<w:p><w:pPr><w:bidi/><w:jc w:val="right"/>'
+    '<w:spacing w:after="0"/></w:pPr>${_run(text, size: 26)}</w:p>';
+
+/// A bordered table; w:bidiVisual puts the first cell (column 0) on the right.
+String _docxTable(ExportBlock block) {
+  final cols = block.rows.fold<int>(1, (n, r) => r.cells.length > n ? r.cells.length : n);
+  const border = 'w:val="single" w:sz="4" w:space="0" w:color="808080"';
+  final out = StringBuffer('<w:tbl><w:tblPr><w:bidiVisual/><w:tblW w:w="5000" w:type="pct"/>'
+      '<w:tblBorders><w:top $border/><w:left $border/><w:bottom $border/><w:right $border/>'
+      '<w:insideH $border/><w:insideV $border/></w:tblBorders></w:tblPr><w:tblGrid>');
+  for (var c = 0; c < cols; c++) {
+    out.write('<w:gridCol/>');
+  }
+  out.write('</w:tblGrid>');
+  for (final r in block.rows) {
+    out.write('<w:tr>');
+    for (var c = 0; c < cols; c++) {
+      out.write('<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>'
+          '${_cellParagraph(c < r.cells.length ? r.cells[c] : '')}</w:tc>');
+    }
+    out.write('</w:tr>');
+  }
+  out.write('</w:tbl><w:p/>');
+  return out.toString();
+}
+
+String _docxBlock(ExportBlock block) {
+  switch (block.type) {
+    case 'Title':
+      return block.rows.map((r) => _titleParagraph(r.cells.join(' '))).join();
+    case 'Table':
+      return _docxTable(block);
+    default:
+      return '${block.rows.map((r) => _rtlParagraph(r.bullet ? '• ${r.cells.join(' ')}' : r.cells.join(' '))).join()}<w:p/>';
+  }
+}
+
 /// Builds a minimal, valid WordprocessingML document: each book page starts
-/// on a new Word page with its "=== Page N ===" header; every text line is a
-/// right-to-left paragraph.
+/// on a new Word page with its "=== Page N ===" header, followed by the page
+/// laid out like the book: centred bold headings, one right-to-left
+/// paragraph per printed line, bullets, and real bordered tables.
 Uint8List buildBookDocx(List<ExportPage> pages) {
   final body = StringBuffer();
   for (var i = 0; i < pages.length; i++) {
     if (i > 0) body.write(_pageBreak);
     body.write(_headerParagraph(pages[i].header));
+    if (pages[i].blocks.isNotEmpty) {
+      pages[i].blocks.map(_docxBlock).forEach(body.write);
+      continue;
+    }
     for (final line in pages[i].text.split('\n')) {
       body.write(line.trim().isEmpty ? '<w:p/>' : _rtlParagraph(_displayLine(line)));
     }

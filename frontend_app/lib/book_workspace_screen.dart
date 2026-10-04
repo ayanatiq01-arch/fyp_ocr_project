@@ -16,11 +16,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 
-import 'api_service.dart';
 import 'app_settings.dart';
 import 'book_session.dart';
 import 'select_text_screen.dart';
 import 'export_service.dart';
+import 'page_markdown.dart';
 import 'theme.dart';
 
 class BookWorkspaceScreen extends StatefulWidget {
@@ -206,8 +206,8 @@ class _ReviewLegend extends StatelessWidget {
   }
 }
 
-/// One page of the master document: "=== Page N ===" + its text, laid out
-/// like the printed page (title, paragraphs, bullets, table columns).
+/// One page of the master document: "=== Page N ===" + the page rendered
+/// as Markdown, like the printed page (headings, line breaks, bullets, tables).
 class _PageCard extends StatelessWidget {
   const _PageCard({required this.page, required this.isLow, required this.onRemove});
 
@@ -254,81 +254,15 @@ class _PageCard extends StatelessWidget {
                 child: Text('- no text found on this page -'),
               )
             else
-              Directionality(
-                textDirection: TextDirection.rtl,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    for (final block in blocks) ...[
-                      _BlockView(block: block, isLow: isLow),
-                      const SizedBox(height: 12),
-                    ],
-                  ],
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: MarkdownPage(
+                  markdown: pageMarkdown(page.result, isLow: isLow),
+                  language: pageLanguage(page.result),
                 ),
               ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _BlockView extends StatelessWidget {
-  const _BlockView({required this.block, required this.isLow});
-
-  final OcrBlock block;
-  final bool Function(double confidence) isLow;
-
-  @override
-  Widget build(BuildContext context) {
-    final title = block.type == 'Title';
-    return Column(
-      crossAxisAlignment: title ? CrossAxisAlignment.center : CrossAxisAlignment.start,
-      children: [
-        for (final row in block.rows)
-          Wrap(
-            alignment: title ? WrapAlignment.center : WrapAlignment.start,
-            spacing: block.isTable ? 4 : 6,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              if (row.isBullet) Text('•', style: scriptStyle('urdu')),
-              for (var i = 0; i < row.cells.length; i++) ...[
-                if (block.isTable && i > 0)
-                  const Text('|', style: TextStyle(color: HarfColors.gold)),
-                _Word(cell: row.cells[i], bold: title, isLow: isLow),
-              ],
-            ],
-          ),
-      ],
-    );
-  }
-}
-
-/// A recognised word / box. Low-confidence words get a gold background.
-class _Word extends StatelessWidget {
-  const _Word({required this.cell, required this.bold, required this.isLow});
-
-  final OcrCell cell;
-  final bool bold;
-  final bool Function(double confidence) isLow;
-
-  @override
-  Widget build(BuildContext context) {
-    if (cell.text.isEmpty) return const SizedBox.shrink();
-    final low = isLow(cell.confidence);
-    final style = scriptStyle(cell.language, size: bold ? 22 : 19)
-        .copyWith(fontWeight: bold ? FontWeight.w700 : FontWeight.w400);
-    return Tooltip(
-      message: cell.engine == 'Gemini'
-          ? 'Read by Gemini AI'
-          : '${cell.engine} - ${cell.confidence.toStringAsFixed(0)}% confidence',
-      triggerMode: TooltipTriggerMode.tap,
-      child: Container(
-        padding: low ? const EdgeInsets.symmetric(horizontal: 4) : EdgeInsets.zero,
-        decoration: low
-            ? BoxDecoration(color: HarfColors.lowConfidence, borderRadius: BorderRadius.circular(4))
-            : null,
-        child: Text(cell.text, style: style),
       ),
     );
   }

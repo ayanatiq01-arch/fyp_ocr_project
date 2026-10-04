@@ -5,6 +5,9 @@
 // Gemini AI page reading.
 // Also owns the ApiService for the current server URL.
 
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -34,6 +37,10 @@ class AppSettings extends ChangeNotifier {
   bool _highlight;
   bool _aiCorrect;
   bool? _serverOnline;
+  bool _discovering = false;
+
+  /// True while [discoverServer] scans the Wi-Fi network.
+  bool get discovering => _discovering;
 
   ApiService get api => _api;
   String get serverUrl => _api.baseUrl;
@@ -67,6 +74,75 @@ class AppSettings extends ChangeNotifier {
       notifyListeners();
     }
     return ok;
+  }
+
+  /// Checks the saved server; if it does not answer (PC switched off, server
+  /// restarted, or the PC got a new IP from the router), scans the Wi-Fi
+  /// network for it. Returns true if a server is reachable afterwards.
+  Future<bool> ensureServer() async {
+    if (await checkServer()) return true;
+    return discoverServer();
+  }
+
+  /// Finds the HarfScan server on the phone's Wi-Fi network: every address
+  /// of the phone's /24 subnet is tried on the server's port (fast TCP
+  /// connect, then GET /health). The first server found is saved.
+  Future<bool> discoverServer() async {
+    if (_discovering) return false;
+    _discovering = true;
+    _serverOnline = null;
+    notifyListeners();
+    try {
+      final saved = Uri.tryParse(serverUrl);
+      final port = (saved != null && saved.hasPort) ? saved.port : 8000;
+      final hosts = <String>[];
+      if (saved != null && saved.host.isNotEmpty) hosts.add(saved.host);
+      final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (addr.isLoopback) continue;
+          final parts = addr.address.split('.');
+          if (parts.length != 4) continue;
+          final prefix = parts.take(3).join('.');
+          for (var i = 1; i < 255; i++) {
+            final host = '$prefix.$i';
+            if (host != addr.address && !hosts.contains(host)) hosts.add(host);
+          }
+        }
+      }
+      const wave = 64;
+      for (var start = 0; start < hosts.length; start += wave) {
+        final batch = hosts.sublist(start, start + wave > hosts.length ? hosts.length : start + wave);
+        final found = await _firstServer(batch, port);
+        if (found != null) {
+          await setServerUrl('http://$found:$port');
+          return _serverOnline == true;
+        }
+      }
+      _serverOnline = false;
+      return false;
+    } finally {
+      _discovering = false;
+      notifyListeners();
+    }
+  }
+
+  static Future<String?> _firstServer(List<String> hosts, int port) async {
+    final results = await Future.wait(hosts.map((host) async {
+      try {
+        final socket = await Socket.connect(host, port, timeout: const Duration(milliseconds: 700));
+        socket.destroy();
+      } catch (_) {
+        return null;
+      }
+      final api = ApiService(baseUrl: 'http://$host:$port');
+      try {
+        return await api.healthCheck() ? host : null;
+      } finally {
+        api.dispose();
+      }
+    }));
+    return results.firstWhere((h) => h != null, orElse: () => null);
   }
 
   Future<void> setServerUrl(String url) async {

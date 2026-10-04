@@ -33,7 +33,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
-    _settings.checkServer();
+    _settings.ensureServer(); // finds the server again if the PC's IP changed
     _recoverLostPhoto();
   }
 

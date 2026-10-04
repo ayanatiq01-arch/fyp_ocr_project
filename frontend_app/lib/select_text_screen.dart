@@ -75,6 +75,7 @@ enum _Phase { reading, selecting, failed }
 class _SelectTextScreenState extends State<SelectTextScreen> {
   StreamSubscription<OcrEvent>? _scan;
   _Phase _phase = _Phase.reading;
+  bool _retried = false; // one automatic retry after finding the server again
   String _stage = ''; // server stage: 'ai_reading' / 'local_ocr'
   String _error = '';
   OcrResult? _result;
@@ -138,11 +139,29 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
           }
         });
       },
-      onError: (Object e) {
+      onError: (Object e) async {
+        if (!mounted) return;
+        final unreachable = e is ApiException &&
+            (e.message.startsWith('Cannot reach') || e.message.startsWith('The server did not respond')) &&
+            !_retried;
+        if (unreachable) {
+          // Server not reachable (restarted / new IP): look for it on the
+          // Wi-Fi network and try once more before showing an error.
+          _retried = true;
+          setState(() => _stage = 'searching');
+          if (await widget.settings.discoverServer() && mounted) {
+            _read();
+            return;
+          }
+        }
         if (!mounted) return;
         setState(() {
           _phase = _Phase.failed;
           _error = e is ApiException ? e.message : 'Reading failed: $e';
+          if (unreachable) {
+            _error += '\n\nThe HarfScan server was not found on this Wi-Fi. Make sure the PC '
+                'is on, the server window is open, and the phone is on the same Wi-Fi.';
+          }
         });
       },
       cancelOnError: true,
@@ -476,7 +495,9 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
           borderRadius: BorderRadius.circular(3),
         ),
         const SizedBox(height: 10),
-        Text(_stage == 'ai_reading'
+        Text(_stage == 'searching'
+            ? 'Server not reachable - searching the Wi-Fi network...'
+            : _stage == 'ai_reading'
             ? 'Gemini AI is reading the page...'
             : total == 0 && _stage == 'local_ocr'
                 ? 'Gemini unavailable - reading with the local OCR...'

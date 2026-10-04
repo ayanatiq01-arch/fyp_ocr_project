@@ -415,7 +415,13 @@ class GeminiPageReader:
         "spelling, harakat only where printed, digits, brackets and punctuation. Do not "
         "translate, correct or add anything. If a line starts with a bullet symbol set "
         "is_bullet true and leave the symbol out of the text. Include headers, page numbers "
-        "and every line - skip nothing.")
+        "and every line - skip nothing.\n"
+        "Strictly preserve the exact visual formatting of the page: one row per physical "
+        "printed line (the line breaks must match the book exactly - never join or split "
+        "lines), a prominent heading is its own Title block, bulleted items are List rows "
+        "with is_bullet true, and paragraphs that are visually separated are separate "
+        "blocks. The server turns this structure into a Markdown document (## headings, "
+        "- bullets, line breaks, tables).")
     SCHEMA = {"type": "OBJECT", "properties": {"blocks": {"type": "ARRAY", "items": {
         "type": "OBJECT", "properties": {
             "type": {"type": "STRING", "enum": ["Title", "Text", "List", "Table"]},
@@ -1181,6 +1187,74 @@ def _is_noise(cell: Cell) -> bool:
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Markdown output
+# --------------------------------------------------------------------------- #
+_MD_INLINE = re.compile(r"([\\`*_\[\]<>|~])")
+_MD_LINE_START = re.compile(r"^(\s*)([#>+\-=]|\d+[.)])")
+
+
+def md_escape(text: str, table: bool = False) -> str:
+    """Escape Markdown syntax characters in recognised text so it is shown
+    literally (Urdu / Arabic text rarely contains them, digits and
+    brackets in it must not turn into lists or links)."""
+    text = _MD_INLINE.sub(r"\\\1", " ".join(text.split()))
+    return text if table else _MD_LINE_START.sub(lambda m: m.group(1) + "\\" + m.group(2), text)
+
+
+def blocks_to_markdown(blocks: Sequence["Block"]) -> str:
+    """Markdown that mirrors the printed page:
+
+    * Title          -> ``## heading`` (one per printed line)
+    * Text / List    -> one Markdown line per printed line, joined with hard
+                        line breaks (two trailing spaces), bullets as ``- ``
+    * Table          -> GitHub table; column 0 (right-most in the book) is the
+                        first Markdown column, which right-to-left renderers
+                        show on the right. The first row is used as the
+                        header row (Markdown tables need one).
+    * blocks are separated by a blank line.
+    """
+    out: List[str] = []
+    for block in blocks:
+        if block.type == "Table":
+            cols = max(block.columns, 1)
+            lines = []
+            for i, row in enumerate(block.rows):
+                slots = [""] * cols
+                for c in row.cells:
+                    if c.text and c.column < cols:
+                        slots[c.column] = (slots[c.column] + " " + md_escape(c.text, True)).strip()
+                lines.append("| " + " | ".join(s or " " for s in slots) + " |")
+                if i == 0:
+                    lines.append("|" + "|".join([" --- "] * cols) + "|")
+            if lines:
+                out.append("\n".join(lines))
+            continue
+        lines = []
+        for row in block.rows:
+            text = " ".join(md_escape(c.text) for c in row.cells if c.text)
+            if not text:
+                continue
+            if block.type == "Title":
+                lines.append(f"## {text}")
+            elif row.is_bullet:
+                lines.append(f"- {text}")
+            else:
+                lines.append(text)
+        if not lines:
+            continue
+        if block.type == "Title":
+            out.append("\n\n".join(lines))
+        else:
+            # Hard line break after every printed line (not after list items,
+            # which already start their own line).
+            joined = [line + ("  " if i < len(lines) - 1 and not lines[i + 1].startswith("- ")
+                              and not line.startswith("- ") else "")
+                      for i, line in enumerate(lines)]
+            out.append("\n".join(joined))
+    return "\n\n".join(out) + ("\n" if out else "")
+
+
 @dataclass
 class PipelineResult:
     pre: ip.PreprocessResult
@@ -1195,6 +1269,10 @@ class PipelineResult:
         blocks, one line per printed line, TAB between table columns, bullets
         as '• '."""
         return "\n\n".join(t for t in (b.text() for b in self.blocks) if t)
+
+    def markdown(self) -> str:
+        """The page as a Markdown document (see :func:`blocks_to_markdown`)."""
+        return blocks_to_markdown(self.blocks)
 
 
 class OcrPipeline:

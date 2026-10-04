@@ -128,6 +128,8 @@ class OcrResponse(BaseModel):
                     "right-to-left (X): the exact reading order of the original layout")
     formatted_text: str = Field(..., description="Page text: blank line between blocks, "
                                                  "TAB between table columns, '• ' bullets")
+    markdown: str = Field("", description="The page as Markdown: ## headings, - bullets, one "
+                                          "line per printed line (hard breaks), tables")
     processing_ms: int
     ai_correction: str = Field("off", description="Gemini model that read the page, 'off' "
                                                   "(local OCR), or 'failed: <reason>' (local OCR "
@@ -182,6 +184,7 @@ def to_response(request_id: str, result: PipelineResult) -> OcrResponse:
         blocks=blocks_out,
         reading_order=reading,
         formatted_text=result.formatted_text(),
+        markdown=result.markdown(),
         processing_ms=result.processing_ms,
         ai_correction=result.ai_correction,
     )

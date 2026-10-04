@@ -32,6 +32,16 @@
 
 In both cases the formatted text keeps the page structure: a blank line between blocks, TAB between table columns, and `• ` for bullets.
 
+The response also has **`markdown`**, the page as a Markdown document built from the same blocks (`blocks_to_markdown`):
+- A Title becomes a `## heading`.
+- Every printed line keeps its own line, joined with a hard line break.
+- Bullets become `- ` items.
+- Tables become Markdown tables; the first column is the right-most column in the book.
+- Blocks are separated by a blank line.
+- Markdown characters in the text are escaped.
+
+The app renders this format and uses the same rules for its PDF and Word export.
+
 ## Setup (Windows, Python 3.11)
 
 ```bat
@@ -45,12 +55,14 @@ The first start downloads these models to `%USERPROFILE%\.paddlex\official_model
 
 ## Run
 
-```bat
-venv\Scripts\python main.py
-```
+Double-click **`start_server.bat`**. It opens a server window, shows the address to use in the app, and starts the server again by itself if it ever stops. Close the window to stop the server.
+
+To start the server automatically every time you log in to Windows, run **`install_autostart.bat`** once. It puts a small launcher in your Startup folder; no admin rights are needed. `uninstall_autostart.bat` undoes it.
 
 - API docs: http://localhost:8000/docs
 - A phone on the same Wi-Fi uses `http://<PC-LAN-IP>:8000`. If the phone can't connect, allow TCP port 8000 for the local network in Windows Firewall.
+- **The app finds the server by itself.** When the saved address doesn't answer (for example, the router gave the PC a new IP), the app scans the phone's Wi-Fi network on port 8000 and saves the server it finds. Settings also has a **Find server automatically** button.
+- The phone still can't connect while the PC is asleep or switched off. Keep the PC awake while scanning.
 
 ```bash
 curl -F "file=@page.jpg" http://localhost:8000/api/v1/ocr            # final JSON
@@ -91,6 +103,11 @@ The free tier allows about **20 requests per day for each model**, and each page
                           }, ...]}]}
   ],
   "formatted_text": "…",
+  "markdown": "## سبق نمبر ۸ کے الفاظ کے معانی
+
+| سَمِعَ | اس نے سنا | … |
+| --- | --- | … |
+…",
   "processing_ms": 80269,
   "ai_correction": "gemini-3.6-flash"
 }

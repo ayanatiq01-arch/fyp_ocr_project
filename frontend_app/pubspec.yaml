@@ -1,7 +1,7 @@
 name: frontend_app
 description: HarfScan - Bilingual (Urdu & Arabic) OCR scanner and book digitizer.
 publish_to: "none"
-version: 2.4.0+6
+version: 2.5.0+7
 
 environment:
   sdk: ^3.13.0
@@ -26,6 +26,10 @@ dependencies:
   archive: ^4.3.0
   # Remembers settings (server URL, review threshold, ...).
   shared_preferences: ^2.5.5
+  # Renders pages as Markdown (bullets, headings, line breaks, tables).
+  # flutter_markdown is discontinued; this is its official replacement.
+  flutter_markdown_plus: ^1.0.12
+  markdown: ^7.3.1
 
 dev_dependencies:
   flutter_test:

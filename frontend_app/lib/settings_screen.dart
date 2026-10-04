@@ -44,6 +44,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
         content: Text(ok ? 'Connected to the OCR server' : 'Server not reachable at ${_settings.serverUrl}')));
   }
 
+  Future<void> _findServer() async {
+    final ok = await _settings.discoverServer();
+    if (!mounted) return;
+    _url.text = _settings.serverUrl;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(ok
+            ? 'Server found at ${_settings.serverUrl}'
+            : 'No HarfScan server found on this Wi-Fi')));
+  }
+
   Future<void> _clearBook() async {
     final ok = await showDialog<bool>(
       context: context,
@@ -121,7 +131,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               Text(status, style: TextStyle(color: color, fontWeight: FontWeight.w600)),
               const Spacer(),
               TextButton.icon(
-                onPressed: _settings.checkServer,
+                onPressed: _settings.discovering ? null : _settings.checkServer,
                 icon: const Icon(Icons.refresh, size: 18),
                 label: const Text('Check'),
               ),
@@ -154,6 +164,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
               icon: const Icon(Icons.save),
               label: const Text('Save & test connection'),
               style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: _settings.discovering ? null : _findServer,
+              icon: _settings.discovering
+                  ? const SizedBox(
+                      width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.wifi_find),
+              label: Text(_settings.discovering ? 'Searching the Wi-Fi...' : 'Find server automatically'),
+              style: OutlinedButton.styleFrom(minimumSize: const Size(0, 48)),
             ),
             const SizedBox(height: 10),
             Text(
@@ -240,7 +260,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: Text('• $line', style: Theme.of(context).textTheme.bodySmall),
                 ),
               const SizedBox(height: 8),
-              Text('Version 2.4.0', style: Theme.of(context).textTheme.bodySmall),
+              Text('Version 2.5.0', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ),
