@@ -20,8 +20,15 @@
 
 **Fallback: local OCR.** Used when Gemini is off or unavailable (no key, no internet, quota used up for every model):
 
-1. **Orientation and cleaning.** The page is turned upright (0/90/180/270°) and straightened by up to ±15°. Shadows are removed, and the page is denoised and binarised.
+1. **Orientation and cleaning.** The text detector runs on the photo as it is.
+   - Upright text lines give almost only wide boxes. If fewer than 80 % are wide, the page is also tried turned 90°, and the direction with wide lines wins.
+   - 0° vs 180° is then decided by recognition confidence.
+   - Earlier, ink profiles decided this, and page frames and borders could fool them into turning an upright page 90°.
+
+   The page is then straightened by up to ±15°. Shadows are removed, and the page is denoised and binarised.
 2. **Auto-crop.** PaddleOCR's text detector (`PP-OCRv5_mobile_det`) finds every text line and table cell. Any ink the detector misses is picked up by an OpenCV fallback.
+   - Two full-width lines are never merged; only pieces of one word are.
+   - Where consecutive lines overlap in height (tall Nastaliq letters, small photos), the boundary is placed in the middle of the overlap, so each crop holds exactly one line.
 3. **Layout.**
    - Boxes are chained into rows, each box to its nearest neighbour on the left. This keeps rows intact on curved pages.
    - Rows are grouped into blocks wherever the vertical gap is less than 0.8 line heights.

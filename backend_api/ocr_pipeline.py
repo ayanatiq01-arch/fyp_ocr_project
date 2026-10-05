@@ -104,10 +104,12 @@ GEMINI_MODELS = [m.strip() for m in os.getenv(
                      "gemini-3.5-flash,gemini-3-flash-preview,"
                      # Last resort (own daily quota, ~5 s, but they may join
                      # lines and drop ayah numbers): better than local OCR.
-                     "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.1-flash-lite"
+                     "gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
                      ).split(",") if m.strip()]
 # Long side of the photo sent to Gemini (pixels).
 GEMINI_MAX_SIDE = int(os.getenv("GEMINI_MAX_SIDE", "2000"))
+# Smaller photos are enlarged to this long side before they are sent.
+GEMINI_MIN_SIDE = int(os.getenv("GEMINI_MIN_SIDE", "1600"))
 # Gemini gives no per-word score; its text is reported with this confidence.
 GEMINI_CONFIDENCE = 0.99
 GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "60"))  # seconds for the whole page
@@ -427,13 +429,22 @@ class GeminiPageReader:
         "translate, correct or add anything. If a line starts with a bullet symbol set "
         "is_bullet true and leave the symbol out of the text. Include headers, page numbers "
         "and every line - skip nothing.\n"
-        "Copy every mark exactly where it stands on the page, nothing may be dropped or "
-        "normalised: Quranic verse (ayah) numbers and end-of-ayah signs after each verse "
-        "(e.g. ۝١, ﴿٢﴾, (٣), ۴), with the same digits as printed "
-        "(Arabic-Indic ١٢٣, Urdu ۱۲۳ or 123); "
-        "inverted commas and quotation marks (“ ” ‘ ’ « » \" '); brackets ( ) [ ] "
-        "﴾ ﴿; and all punctuation (، ؛ ؟ ۔ . : ! - –), plus Quranic "
-        "pause marks and harakat where printed.\n"
+        "CHECKLIST - these marks are part of the text and must NEVER be dropped:\n"
+        "1. End of ayah: after every Quranic verse the book prints a small circle or "
+        "rosette, usually with the verse number inside. Write it right after the verse as "
+        "\u06dd followed by that number in the same digits as printed, e.g. "
+        "\u06dd\u0669  \u06dd\u0661\u0660  \u06dd\u06f1\u06f2. If the verse number is printed "
+        "in brackets instead, copy the brackets: \ufd3f\u0662\ufd3e (\u0663).\n"
+        "2. Ruku sign: the letter \u0639 (sometimes with numbers) printed at the end of a "
+        "section, in the line or in the margin - copy it where it appears.\n"
+        "3. Waqf / pause marks printed above the Quran text (\u0637 \u062c \u0645 \u0644\u0627 "
+        "\u0632 \u0635\u0644\u06d2 \u06da \u06d6 \u06d7 \u06db) - copy each one right after the word "
+        "it stands on.\n"
+        "4. Inverted commas and quotation marks around quoted speech (\u201c \u201d \u2018 "
+        "\u2019 \u00ab \u00bb \" '), even when only the closing one is visible on this page.\n"
+        "5. Brackets ( ) [ ] \ufd3e \ufd3f, footnote numbers and markers, the page number and "
+        "all punctuation (\u060c \u061b \u061f \u06d4 . : ! - \u2013).\n"
+        "Keep harakat exactly as printed; do not add or remove any.\n"
         "Strictly preserve the exact visual formatting of the page: one row per physical "
         "printed line (the line breaks must match the book exactly - never join or split "
         "lines), a prominent heading is its own Title block, bulleted items are List rows "
@@ -474,9 +485,16 @@ class GeminiPageReader:
         """Gemini's JSON page for the photo (boxes on a 0-1000 scale)."""
         import base64
         h, w = image_bgr.shape[:2]
-        s = min(1.0, GEMINI_MAX_SIDE / float(max(h, w)))
-        send = cv2.resize(image_bgr, (max(1, int(w * s)), max(1, int(h * s))),
-                          interpolation=cv2.INTER_AREA) if s < 1.0 else image_bgr
+        long_side = float(max(h, w))
+        # Big photos are reduced to GEMINI_MAX_SIDE; small ones (e.g. sent via
+        # WhatsApp) are enlarged to GEMINI_MIN_SIDE so tiny marks - ayah
+        # numbers in their circles, waqf signs, quotes - stay legible.
+        s = min(1.0, GEMINI_MAX_SIDE / long_side)
+        if long_side < GEMINI_MIN_SIDE:
+            s = GEMINI_MIN_SIDE / long_side
+        send = image_bgr if s == 1.0 else cv2.resize(
+            image_bgr, (max(1, int(w * s)), max(1, int(h * s))),
+            interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
         ok, buf = cv2.imencode(".jpg", send, [cv2.IMWRITE_JPEG_QUALITY, 92])
         body = {
             "contents": [{"role": "user", "parts": [
@@ -646,7 +664,7 @@ class TextDetector:
             return self._drop_vertical_strips(self._fallback(binary, []))
         boxes = self._drop_vertical_strips(boxes)
         boxes = self._merge_stacked(self._split_tall(gray, binary, boxes))
-        boxes = self._resolve_containment(boxes)
+        boxes = self._trim_stacked_overlap(self._resolve_containment(boxes))
         # The OpenCV fallback can pick up page borders too: filter again.
         return self._drop_vertical_strips(self._fallback(binary, boxes))
 
@@ -748,6 +766,28 @@ class TextDetector:
         return kept or boxes
 
     @staticmethod
+    def _trim_stacked_overlap(boxes: List[ip.Box]) -> List[ip.Box]:
+        """Consecutive full-width lines whose boxes overlap in height (tall
+        Nastaliq letters, small photos) are cut at the middle of the overlap,
+        so each crop holds one line and not the top of the next one."""
+        if len(boxes) < 2:
+            return boxes
+        median_h = float(np.median([b[3] - b[1] for b in boxes]))
+        out = [list(b) for b in sorted(boxes, key=lambda b: b[1])]
+        for i, a in enumerate(out):
+            for b in out[i + 1:]:
+                narrower = min(a[2] - a[0], b[2] - b[0])
+                overlap_x = min(a[2], b[2]) - max(a[0], b[0])
+                overlap_y = a[3] - b[1]
+                if narrower < 4 * median_h or overlap_x < 0.6 * narrower or overlap_y <= 0:
+                    continue
+                if b[1] - a[1] < 0.5 * min(a[3] - a[1], b[3] - b[1]):
+                    continue                       # same line, not the next one
+                cut = (a[3] + b[1]) // 2
+                a[3], b[1] = cut, cut
+        return [tuple(b) for b in out if b[3] - b[1] > 0.3 * median_h]
+
+    @staticmethod
     def _merge_stacked(boxes: List[ip.Box]) -> List[ip.Box]:
         """Re-join a word the detector cut into an upper and a lower part.
 
@@ -771,8 +811,11 @@ class TextDetector:
                     narrower = min(a[2] - a[0], b[2] - b[0])
                     gap_y = max(a[1], b[1]) - min(a[3], b[3])      # < 0 if overlapping
                     union = ip.union_box([a, b])
+                    # Two full-width lines (tall Nastaliq lines overlap in
+                    # height) are never merged - only pieces of a word.
+                    both_lines = narrower > 4 * median_h
                     if overlap_x > 0.6 * narrower and gap_y < 0.3 * median_h and \
-                            union[3] - union[1] <= 1.6 * median_h:
+                            union[3] - union[1] <= 1.6 * median_h and not both_lines:
                         boxes[i] = union
                         del boxes[j]
                         merged = True
@@ -1449,11 +1492,25 @@ class OcrPipeline:
                 logger.warning("Gemini page reading failed, using local OCR: %s", exc)
                 ai_status = f"failed: {str(exc)[:160]}"
             yield "status", "local_ocr"
-        # Orientation: text axis from profiles, then 0 vs 180 deg checked on
-        # the detected text boxes. Only an upside-down page is processed twice.
-        turns, flipped_turns = self._orientation_candidates(image_bgr)
-        pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
+        # Orientation: detect text boxes on the photo as it is; if they are
+        # mostly tall (lines running top-to-bottom) the page is turned 90 deg.
+        # Then 0 vs 180 deg is checked on the detected boxes. Only a sideways
+        # or upside-down page is processed twice.
+        turns, flipped_turns = 0, 2
+        pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=0)
         boxes = self._page_boxes(pre)
+        wide = self._wide_fraction(boxes)
+        if wide < 0.8:
+            # Upright text lines give ~100 % wide boxes; a sideways page gives
+            # small pieces (~50 %). Try the page turned 90 deg and keep the
+            # direction in which the lines come out wide.
+            pre_t = ip.preprocess(image_bgr, max_side=2000, quarter_turns=1)
+            boxes_t = self._page_boxes(pre_t)
+            wide_t = self._wide_fraction(boxes_t)
+            logger.info("orientation: wide boxes %.0f%% as photographed, %.0f%% turned 90 deg",
+                        100 * wide, 100 * wide_t)
+            if wide_t > wide:
+                turns, flipped_turns, pre, boxes = 1, 3, pre_t, boxes_t
         if self._is_upside_down(pre, boxes):
             turns = flipped_turns
             pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
@@ -1600,12 +1657,14 @@ class OcrPipeline:
         return out
 
     @staticmethod
-    def _orientation_candidates(image_bgr: np.ndarray) -> Tuple[int, int]:
-        """Projection profiles decide whether text lines run horizontally
-        (candidates 0 / 180 deg) or vertically (90 / 270 deg). Returned as
-        CCW quarter turns: (most likely, same axis turned 180 deg)."""
-        _, binary = ip.quick_binary(image_bgr)
-        return (1, 3) if ip.text_runs_vertically(binary) else (0, 2)
+    def _wide_fraction(boxes: List[ip.Box]) -> float:
+        """Share (by area) of the clearly wide boxes among the clearly wide
+        or tall ones. The detector finds text lines in any direction, so
+        this tells the text axis far more reliably than ink profiles, which
+        page borders and frames can dominate. 0.5 when it cannot tell."""
+        wide = sum((b[2] - b[0]) * (b[3] - b[1]) for b in boxes if (b[2] - b[0]) >= 1.5 * (b[3] - b[1]))
+        tall = sum((b[2] - b[0]) * (b[3] - b[1]) for b in boxes if (b[3] - b[1]) >= 1.5 * (b[2] - b[0]))
+        return wide / (wide + tall) if wide + tall else 0.5
 
     def _is_upside_down(self, pre: ip.PreprocessResult, boxes: List[ip.Box]) -> bool:
         """Read a sample of the DETECTED text boxes with the fast PaddleOCR

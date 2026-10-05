@@ -351,45 +351,6 @@ def quick_binary(image_bgr: np.ndarray, max_side: int = 1200
     return gray, binary
 
 
-def _line_band_score(ink: np.ndarray, max_skew: float = 15.0) -> float:
-    """How strongly the ink forms horizontal bands (text lines).
-
-    Coefficient of variation (std / mean) of the smoothed row profile:
-    horizontal text lines alternate full / empty rows (high value); text
-    running vertically spreads ink evenly over the rows (low value). The best
-    value over small tilts is used so a skewed photo is not penalised.
-    (Squared row-to-row differences do NOT work: the gaps between Nastaliq
-    words create many small jumps across columns too.)
-    """
-    h, w = ink.shape
-    best = 0.0
-    for angle in np.arange(-max_skew, max_skew + 1e-9, 3.0):
-        m = cv2.getRotationMatrix2D((w / 2, h / 2), float(angle), 1.0)
-        rotated = cv2.warpAffine(ink, m, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
-        profile = np.convolve(rotated.sum(axis=1), np.ones(9) / 9, mode="same")
-        mean = profile.mean()
-        if mean > 0:
-            best = max(best, float(profile.std() / mean))
-    return best
-
-
-def text_runs_vertically(binary: np.ndarray) -> bool:
-    """True if the text lines run top-to-bottom (page photographed 90° off).
-
-    The ink is resized to a square so both directions are measured on equal
-    terms, then the line-band score of the image is compared with that of
-    its transpose.
-    """
-    ink = (binary == 0).astype(np.float32)
-    if ink.mean() < 0.002:
-        return False
-    ink = cv2.resize(ink, (600, 600), interpolation=cv2.INTER_AREA)
-    horizontal = _line_band_score(ink)
-    vertical = _line_band_score(np.ascontiguousarray(ink.T))
-    logger.debug("orientation bands: horizontal=%.3f vertical=%.3f", horizontal, vertical)
-    return vertical > horizontal
-
-
 def find_vertical_rules(binary: np.ndarray, min_fraction: float = 0.35) -> List[int]:
     """x positions of long vertical printed lines (page frames, column rules,
     the book's fold).
