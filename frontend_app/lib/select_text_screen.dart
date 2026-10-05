@@ -41,7 +41,12 @@ class SelectTextScreen extends StatefulWidget {
       final XFile? photo = await ImagePicker().pickImage(
         source: source,
         preferredCameraDevice: CameraDevice.rear,
-        requestFullMetadata: false, // full resolution: fine print needs every pixel
+        requestFullMetadata: false,
+        // At most 2400 px: plenty for small print (the server reads pages at
+        // 2000 px) and the upload is several times smaller and faster.
+        maxWidth: 2400,
+        maxHeight: 2400,
+        imageQuality: 92,
       );
       if (photo == null) return false; // user cancelled
       final added = await navigator.push<bool>(MaterialPageRoute(

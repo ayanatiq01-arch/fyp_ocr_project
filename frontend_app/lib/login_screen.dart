@@ -4,6 +4,7 @@
 // phone (see auth_service.dart); "Stay signed in" skips this page next time.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'auth_service.dart';
 import 'theme.dart';
@@ -119,7 +120,8 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                             textCapitalization: TextCapitalization.words,
                             textInputAction: TextInputAction.next,
                             autofillHints: const [AutofillHints.name],
-                            decoration: _field('Full name', Icons.person_outline),
+                            decoration: _field('Full name', Icons.person_outline)
+                                .copyWith(suffixIcon: _ClipboardButtons(controller: _name)),
                             validator: (v) => AuthService.validateName(v ?? ''),
                           ),
                         )
@@ -131,7 +133,8 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                   textInputAction: TextInputAction.next,
                   autocorrect: false,
                   autofillHints: const [AutofillHints.email],
-                  decoration: _field('Email', Icons.alternate_email),
+                  decoration: _field('Email', Icons.alternate_email)
+                      .copyWith(suffixIcon: _ClipboardButtons(controller: _email)),
                   validator: (v) => AuthService.validateEmail(v ?? ''),
                 ),
                 const SizedBox(height: 14),
@@ -141,10 +144,14 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                   textInputAction: _signUp ? TextInputAction.next : TextInputAction.done,
                   autofillHints: [_signUp ? AutofillHints.newPassword : AutofillHints.password],
                   decoration: _field('Password', Icons.lock_outline).copyWith(
-                    suffixIcon: IconButton(
-                      tooltip: _showPassword ? 'Hide password' : 'Show password',
-                      icon: Icon(_showPassword ? Icons.visibility_off : Icons.visibility),
-                      onPressed: () => setState(() => _showPassword = !_showPassword),
+                    suffixIcon: _ClipboardButtons(
+                      controller: _password,
+                      allowCopy: _showPassword,
+                      trailing: IconButton(
+                        tooltip: _showPassword ? 'Hide password' : 'Show password',
+                        icon: Icon(_showPassword ? Icons.visibility_off : Icons.visibility),
+                        onPressed: () => setState(() => _showPassword = !_showPassword),
+                      ),
                     ),
                     helperText: _signUp ? 'At least 6 characters, with a number' : null,
                   ),
@@ -162,7 +169,8 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                             controller: _confirm,
                             obscureText: !_showPassword,
                             textInputAction: TextInputAction.done,
-                            decoration: _field('Confirm password', Icons.lock_reset),
+                            decoration: _field('Confirm password', Icons.lock_reset).copyWith(
+                                suffixIcon: _ClipboardButtons(controller: _confirm, allowCopy: _showPassword)),
                             validator: (v) => v != _password.text ? 'Passwords do not match' : null,
                             onFieldSubmitted: (_) => _submit(),
                           ),
@@ -236,4 +244,58 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
         focusedBorder:
             const OutlineInputBorder(borderSide: BorderSide(color: HarfColors.gold, width: 1.5)),
       );
+}
+
+/// Copy and paste buttons inside a text field (long-press also opens the
+/// system Copy / Paste / Select all menu). Passwords can only be copied
+/// while they are shown.
+class _ClipboardButtons extends StatelessWidget {
+  const _ClipboardButtons({required this.controller, this.allowCopy = true, this.trailing});
+
+  final TextEditingController controller;
+  final bool allowCopy;
+  final Widget? trailing;
+
+  Future<void> _paste(BuildContext context) async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim() ?? '';
+    if (text.isEmpty) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('Nothing to paste - copy some text first')));
+      }
+      return;
+    }
+    controller.value = TextEditingValue(
+        text: text, selection: TextSelection.collapsed(offset: text.length));
+  }
+
+  void _copy(BuildContext context) {
+    if (controller.text.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: controller.text));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Copied')));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (allowCopy)
+          IconButton(
+            tooltip: 'Copy',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.copy, size: 20),
+            onPressed: () => _copy(context),
+          ),
+        IconButton(
+          tooltip: 'Paste',
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.content_paste, size: 20),
+          onPressed: () => _paste(context),
+        ),
+        ?trailing,
+      ],
+    );
+  }
 }

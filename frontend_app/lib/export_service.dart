@@ -11,6 +11,7 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/widgets.dart' show BuildContext;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
@@ -370,7 +371,12 @@ class ExportService {
     final String extension;
     switch (format) {
       case ExportFormat.pdf:
-        final images = await capturePages(context, session.pages);
+        List<List<Uint8List>>? images;
+        try {
+          images = await capturePages(context, session.pages);
+        } catch (e) {
+          debugPrint('Rendered PDF not possible, using the text PDF: $e');
+        }
         bytes = images != null && images.length == pages.length
             ? await buildImagePdf(images, title: session.title)
             : await buildBookPdf(

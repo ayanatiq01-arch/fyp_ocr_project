@@ -423,6 +423,13 @@ class GeminiPageReader:
         "translate, correct or add anything. If a line starts with a bullet symbol set "
         "is_bullet true and leave the symbol out of the text. Include headers, page numbers "
         "and every line - skip nothing.\n"
+        "Copy every mark exactly where it stands on the page, nothing may be dropped or "
+        "normalised: Quranic verse (ayah) numbers and end-of-ayah signs after each verse "
+        "(e.g. ۝١, ﴿٢﴾, (٣), ۴), with the same digits as printed "
+        "(Arabic-Indic ١٢٣, Urdu ۱۲۳ or 123); "
+        "inverted commas and quotation marks (“ ” ‘ ’ « » \" '); brackets ( ) [ ] "
+        "﴾ ﴿; and all punctuation (، ؛ ؟ ۔ . : ! - –), plus Quranic "
+        "pause marks and harakat where printed.\n"
         "Strictly preserve the exact visual formatting of the page: one row per physical "
         "printed line (the line breaks must match the book exactly - never join or split "
         "lines), a prominent heading is its own Title block, bulleted items are List rows "
@@ -558,6 +565,11 @@ class GeminiPageReader:
             pending -= 1
             if error is None:
                 self.last_model = model
+                # Speed: the model that answered is asked first next time
+                # (busy models are then only the backups).
+                if model in self.models:
+                    self.models.remove(model)
+                    self.models.insert(0, model)
                 return result
             errors.append(f"{model}: {str(error)[:80]}")
             if not pending:

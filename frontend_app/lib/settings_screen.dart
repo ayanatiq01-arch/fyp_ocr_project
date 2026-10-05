@@ -1,14 +1,13 @@
 // settings_screen.dart
 //
-// Settings: script of the book (Urdu / Arabic / Mixed), how the app works,
-// server connection, review highlighting, account and About. Everything is
+// Settings: how the app works, server connection, review highlighting,
+// account and About. Everything is
 // remembered between launches (see app_settings.dart).
 
 import 'package:flutter/material.dart';
 
 import 'app_settings.dart';
 import 'auth_service.dart';
-import 'book_session.dart';
 import 'theme.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -129,20 +128,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             builder: (context, _) => ListView(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
               children: [
-                const SectionLabel('Script of the book'),
-                for (final (lang, sample, subtitle) in const [
-                  (OcrLanguage.urdu, 'اردو', 'Nastaliq script'),
-                  (OcrLanguage.arabic, 'العربية', 'Naskh script'),
-                  (OcrLanguage.mixed, 'اردو + عربی', 'Urdu and Arabic on the same page'),
-                ])
-                  _ScriptCard(
-                    language: lang,
-                    sample: sample,
-                    subtitle: subtitle,
-                    selected: _settings.language == lang,
-                    onTap: () => _settings.language = lang,
-                  ),
-                const SizedBox(height: 20),
                 const SectionLabel('How it works'),
                 const _HowItWorks(),
                 const SizedBox(height: 24),
@@ -334,68 +319,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: Text('• $line', style: Theme.of(context).textTheme.bodySmall),
                 ),
               const SizedBox(height: 8),
-              Text('Version 3.0.1', style: Theme.of(context).textTheme.bodySmall),
+              Text('Version 3.1.0', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ),
       );
-}
-
-class _ScriptCard extends StatelessWidget {
-  const _ScriptCard({
-    required this.language,
-    required this.sample,
-    required this.subtitle,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final OcrLanguage language;
-  final String sample;
-  final String subtitle;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      clipBehavior: Clip.antiAlias,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18),
-        side: BorderSide(
-            color: selected ? HarfColors.brightGold : HarfColors.gold.withValues(alpha: 0.35),
-            width: selected ? 2 : 1),
-      ),
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          child: Row(
-            children: [
-              Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off,
-                  color: HarfColors.gold),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(language.label,
-                        style: const TextStyle(
-                            fontSize: 17, fontWeight: FontWeight.w600, color: HarfColors.brightGold)),
-                    Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
-                  ],
-                ),
-              ),
-              Text(sample,
-                  textDirection: TextDirection.rtl,
-                  style: scriptStyle(language == OcrLanguage.arabic ? 'arabic' : 'urdu', size: 22)),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 class _HowItWorks extends StatelessWidget {
@@ -404,7 +332,7 @@ class _HowItWorks extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const steps = [
-      (Icons.translate, 'Choose the script of your book above'),
+      (Icons.translate, 'On the home page, choose the script of the page'),
       (Icons.photo_camera, 'Take or choose a photo of the page'),
       (Icons.touch_app, 'Drag from the first word to the last word'),
       (Icons.auto_stories, 'Add it to the book, then scan the next page'),

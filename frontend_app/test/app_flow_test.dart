@@ -64,8 +64,17 @@ void main() {
     expect(find.text('Welcome to'), findsOneWidget);
     expect(find.text('Hello, Ayan!'), findsOneWidget);
     expect(find.text('My First Book'), findsWidgets);
+    // Scripts are on the home page; Camera / Gallery only after choosing one.
+    expect(find.text('Camera Scan'), findsNothing);
+    await tester.scrollUntilVisible(find.text('Arabic'), 200);
+    await tester.tap(find.text('Arabic'));
+    await pumpUntil(tester, find.text('Camera Scan'));
     expect(find.text('Camera Scan'), findsOneWidget);
-    expect(find.textContaining('Urdu'), findsNothing); // scripts live in Settings now
+    expect(find.text('Gallery Upload'), findsOneWidget);
+    expect(settings.language.apiValue, 'arabic');
+    await tester.pageBack();
+    await pumpUntil(tester, find.text('Welcome to'));
+    await tester.pump(const Duration(milliseconds: 500));
 
     // New book.
     await tester.scrollUntilVisible(find.text('New book'), 200);
@@ -82,11 +91,13 @@ void main() {
     expect(find.text('CONTINUE READING'), findsOneWidget);
     expect(Directory('${docs.path}/books/${auth.user!.id}').listSync().length, 2); // saved on "disk"
 
-    // 3. Settings: scripts, how it works, account; no API name anywhere.
+    // 3. Settings: how it works, account; no scripts, no API name.
     await tester.tap(find.byIcon(Icons.settings));
-    await pumpUntil(tester, find.text('Mixed (Auto)'));
-    expect(find.text('Urdu'), findsOneWidget);
-    expect(find.text('Mixed (Auto)'), findsOneWidget);
+    await pumpUntil(tester, find.text('HOW IT WORKS'));
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100)); // transition done
+    }
+    expect(find.text('Mixed (Auto)'), findsNothing); // scripts are no longer in Settings
     expect(find.textContaining('Gemini'), findsNothing);
     await tester.scrollUntilVisible(find.text('Sign out'), 300, scrollable: find.byType(Scrollable).first);
     await tester.runAsync(() async {
