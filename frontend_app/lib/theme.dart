@@ -5,6 +5,22 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+/// False in widget tests, where fonts cannot be downloaded: the default
+/// font is used instead of Google Fonts.
+bool harfUseGoogleFonts = true;
+
+/// [GoogleFonts] style, or a plain [TextStyle] when [harfUseGoogleFonts] is off.
+TextStyle harfFont(TextStyle Function({double? fontSize, FontWeight? fontWeight, Color? color,
+            double? height, double? letterSpacing})
+        font,
+    {double? fontSize, FontWeight? fontWeight, Color? color, double? height, double? letterSpacing}) {
+  final style = TextStyle(
+      fontSize: fontSize, fontWeight: fontWeight, color: color, height: height, letterSpacing: letterSpacing);
+  if (!harfUseGoogleFonts) return style;
+  return font(
+      fontSize: fontSize, fontWeight: fontWeight, color: color, height: height, letterSpacing: letterSpacing);
+}
+
 class HarfColors {
   const HarfColors._();
 
@@ -44,7 +60,7 @@ ThemeData buildHarfTheme() {
     ),
     scaffoldBackgroundColor: HarfColors.navy,
   );
-  final text = GoogleFonts.poppinsTextTheme(base.textTheme)
+  final text = (harfUseGoogleFonts ? GoogleFonts.poppinsTextTheme(base.textTheme) : base.textTheme)
       .apply(bodyColor: HarfColors.ink, displayColor: HarfColors.ink);
   return base.copyWith(
     textTheme: text,
@@ -52,7 +68,7 @@ ThemeData buildHarfTheme() {
       backgroundColor: Colors.transparent,
       elevation: 0,
       foregroundColor: HarfColors.gold,
-      titleTextStyle: GoogleFonts.poppins(
+      titleTextStyle: harfFont(GoogleFonts.poppins,
           fontSize: 20, fontWeight: FontWeight.w600, color: HarfColors.gold),
     ),
     cardTheme: CardThemeData(
@@ -67,7 +83,7 @@ ThemeData buildHarfTheme() {
       style: FilledButton.styleFrom(
         backgroundColor: HarfColors.gold,
         foregroundColor: HarfColors.navy,
-        textStyle: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+        textStyle: harfFont(GoogleFonts.poppins, fontWeight: FontWeight.w600),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       ),
     ),
@@ -95,16 +111,17 @@ ThemeData buildHarfTheme() {
 TextStyle scriptStyle(String language, {double size = 20, Color? color}) {
   final c = color ?? HarfColors.ink;
   return language == 'arabic'
-      ? GoogleFonts.notoNaskhArabic(fontSize: size, height: 1.8, color: c)
-      : GoogleFonts.notoNastaliqUrdu(fontSize: size * 0.9, height: 2.2, color: c);
+      ? harfFont(GoogleFonts.notoNaskhArabic, fontSize: size, height: 1.8, color: c)
+      : harfFont(GoogleFonts.notoNastaliqUrdu, fontSize: size * 0.9, height: 2.2, color: c);
 }
 
 /// Gold "ح" (Harf) medallion with the HarfScan wordmark.
 class HarfLogo extends StatelessWidget {
-  const HarfLogo({super.key, this.size = 92, this.showTagline = true});
+  const HarfLogo({super.key, this.size = 92, this.showTagline = true, this.showName = true});
 
   final double size;
   final bool showTagline;
+  final bool showName;
 
   @override
   Widget build(BuildContext context) {
@@ -121,16 +138,18 @@ class HarfLogo extends StatelessWidget {
           ),
           alignment: Alignment.center,
           child: Text('ح',
-              style: GoogleFonts.notoNaskhArabic(
+              style: harfFont(GoogleFonts.notoNaskhArabic,
                   fontSize: size * 0.5, fontWeight: FontWeight.w700, color: HarfColors.navy, height: 1.2)),
         ),
+        if (showName) ...[
         SizedBox(height: size * 0.15),
         ShaderMask(
           shaderCallback: HarfColors.goldSheen.createShader,
           child: Text('HarfScan',
-              style: GoogleFonts.cinzel(
+              style: harfFont(GoogleFonts.cinzel,
                   fontSize: size * 0.39, fontWeight: FontWeight.w700, color: Colors.white, letterSpacing: 2)),
         ),
+        ],
         if (showTagline) ...[
           const SizedBox(height: 4),
           Text('Urdu & Arabic OCR for historical books',

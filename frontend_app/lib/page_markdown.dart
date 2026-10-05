@@ -94,28 +94,46 @@ String pageLanguage(OcrResult result) {
 
 /// Renders page Markdown right-to-left in the book's reading font.
 class MarkdownPage extends StatelessWidget {
-  const MarkdownPage({super.key, required this.markdown, required this.language});
+  const MarkdownPage(
+      {super.key, required this.markdown, required this.language, this.paper = false});
 
   final String markdown;
   final String language;
 
+  /// Printed look (dark text on white, for the PDF) instead of the app's
+  /// gold-on-navy look.
+  final bool paper;
+
   @override
   Widget build(BuildContext context) {
-    final base = scriptStyle(language, size: 18);
+    final ink = paper ? Colors.black : HarfColors.ink;
+    final accent = paper ? HarfColors.navy : HarfColors.brightGold;
+    final base = scriptStyle(language, size: paper ? 16 : 18, color: ink);
     final sheet = MarkdownStyleSheet(
       p: base,
       h2: base.copyWith(fontSize: (base.fontSize ?? 18) * 1.25, fontWeight: FontWeight.w700,
-          color: HarfColors.brightGold),
+          color: accent),
       h2Align: WrapAlignment.center,
-      listBullet: base.copyWith(color: HarfColors.gold),
+      listBullet: base.copyWith(color: paper ? Colors.black : HarfColors.gold),
       tableHead: base,
       tableBody: base,
-      tableBorder: TableBorder.all(color: HarfColors.gold.withValues(alpha: 0.45), width: 0.8),
+      tableBorder: TableBorder.all(
+          color: paper ? Colors.black54 : HarfColors.gold.withValues(alpha: 0.45), width: 0.8),
       tableCellsPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       tableColumnWidth: const IntrinsicColumnWidth(),
       blockSpacing: 10,
       textAlign: WrapAlignment.start,
     );
+    final body = MarkdownBody(
+      data: markdown,
+      styleSheet: sheet,
+      extensionSet: md.ExtensionSet(
+        md.ExtensionSet.gitHubFlavored.blockSyntaxes,
+        [_MarkSyntax(), ...md.ExtensionSet.gitHubFlavored.inlineSyntaxes],
+      ),
+      builders: {'mark': _MarkBuilder()},
+    );
+    if (paper) return Directionality(textDirection: TextDirection.rtl, child: body);
     return Directionality(
       textDirection: TextDirection.rtl,
       child: SingleChildScrollView(
@@ -123,17 +141,7 @@ class MarkdownPage extends StatelessWidget {
         reverse: true,
         child: ConstrainedBox(
           constraints: BoxConstraints(minWidth: MediaQuery.sizeOf(context).width - 72),
-          child: IntrinsicWidth(
-            child: MarkdownBody(
-              data: markdown,
-              styleSheet: sheet,
-              extensionSet: md.ExtensionSet(
-                md.ExtensionSet.gitHubFlavored.blockSyntaxes,
-                [_MarkSyntax(), ...md.ExtensionSet.gitHubFlavored.inlineSyntaxes],
-              ),
-              builders: {'mark': _MarkBuilder()},
-            ),
-          ),
+          child: IntrinsicWidth(child: body),
         ),
       ),
     );

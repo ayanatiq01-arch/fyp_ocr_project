@@ -2,7 +2,7 @@
 //
 // User settings, remembered between app launches (shared_preferences):
 // backend server URL, low-confidence review threshold and highlighting,
-// Gemini AI page reading.
+// script, last screen.
 // Also owns the ApiService for the current server URL.
 
 import 'dart:async';
@@ -12,13 +12,15 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api_service.dart';
+import 'book_session.dart';
 
 class AppSettings extends ChangeNotifier {
   AppSettings._(this._prefs)
       : _serverUrl = _prefs.getString(_kServerUrl) ?? ApiService.defaultBaseUrl,
         _threshold = _prefs.getDouble(_kThreshold) ?? 70,
         _highlight = _prefs.getBool(_kHighlight) ?? true,
-        _aiCorrect = _prefs.getBool(_kAiCorrect) ?? true {
+        _aiCorrect = _prefs.getBool(_kAiCorrect) ?? true,
+        _language = OcrLanguage.parse(_prefs.getString(_kLanguage)) {
     _api = ApiService(baseUrl: _serverUrl);
   }
 
@@ -29,6 +31,8 @@ class AppSettings extends ChangeNotifier {
   static const _kThreshold = 'low_confidence_threshold';
   static const _kHighlight = 'highlight_low_confidence';
   static const _kAiCorrect = 'gemini_ai_correct';
+  static const _kLanguage = 'script_language';
+  static const _kLastScreen = 'last_screen';
 
   final SharedPreferences _prefs;
   late ApiService _api;
@@ -36,6 +40,7 @@ class AppSettings extends ChangeNotifier {
   double _threshold;
   bool _highlight;
   bool _aiCorrect;
+  OcrLanguage _language;
   bool? _serverOnline;
   bool _discovering = false;
 
@@ -60,6 +65,19 @@ class AppSettings extends ChangeNotifier {
     _prefs.setBool(_kAiCorrect, value);
     notifyListeners();
   }
+
+  /// Script of the pages being scanned (Settings > Script).
+  OcrLanguage get language => _language;
+  set language(OcrLanguage value) {
+    _language = value;
+    _prefs.setString(_kLanguage, value.apiValue);
+    notifyListeners();
+  }
+
+  /// Screen the user was on when the app closed ("workspace" or "home"),
+  /// so the next launch continues there.
+  String get lastScreen => _prefs.getString(_kLastScreen) ?? 'home';
+  set lastScreen(String value) => _prefs.setString(_kLastScreen, value);
 
   /// True if [confidence] should be highlighted for review.
   bool isLowConfidence(double confidence) => _highlight && confidence < _threshold;

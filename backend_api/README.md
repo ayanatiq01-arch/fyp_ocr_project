@@ -131,7 +131,9 @@ With Gemini, the stream sends `{"event": "status", "stage": "ai_reading"}`, then
 | `GEMINI_MODELS` | `gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview` | Flash models tried in order (Gemini 1.5 Flash is retired) |
 | `GEMINI_MAX_SIDE` | `2000` | Long side (px) of the photo sent to Gemini |
 | `GEMINI_THINKING` | `low` | Gemini 3 thinking level |
-| `GEMINI_TIMEOUT` | `240` | Seconds per request |
+| `GEMINI_TIMEOUT` | `60` | Seconds for the whole page before falling back to local OCR |
+| `GEMINI_HEDGE_AFTER` | `5` | A model that hasn't answered after this many seconds gets the next model as a parallel backup |
+| `GEMINI_ROUNDS` | `3` | Passes over all models when they are only overloaded (HTTP 503) |
 | `MAX_UPLOAD_MB` | `20` | Upload size limit |
 | `KEEP_UPLOADS` | `0` | `1` keeps files in `temp_uploads/` |
 
@@ -163,7 +165,12 @@ With Gemini, the stream sends `{"event": "status", "stage": "ai_reading"}`, then
   - The server PC needs internet.
   - The page photo is sent to Google.
   - The free-tier daily quota.
-- **Gemini 503 "high demand".** Google's Flash models are often briefly overloaded. Each model is retried once, then the next model is tried. Only when all models fail is the page read locally.
+- **Speed and Gemini 503 "high demand".** When a model answers straight away, a page takes about 6–15 s. Google's Flash models are often overloaded, so:
+  - a model that fails (busy, quota used up, or a cut-off answer) hands over to the next model immediately;
+  - a model that hasn't answered after 5 s (a "busy" reply alone can take 11 s) gets the next model as a parallel backup, and the first good answer is used;
+  - if every model is only busy, they are tried again (up to 3 passes, within 60 s).
+
+  Only after that is the page read by the local OCR, which takes about 80 s on this PC. On 2026-10-05 Google was overloaded for most of the day: answers took 7–36 s, and some pages needed the retry passes.
 - **LayoutParser.** The only available Paddle model (PubLayNet) was trained on English research papers and usually finds nothing on Urdu/Arabic pages. So page structure comes from the detected text boxes, and LayoutParser only adds Title/List hints.
 - **Multi-column prose.** Two side-by-side columns of running text are treated as a two-column table. The text is correct, but reading order goes row by row across both columns.
 - **License.** UTRNet code and models are CC BY-NC-SA 4.0, for non-commercial and academic use only.

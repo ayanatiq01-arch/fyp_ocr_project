@@ -11,6 +11,7 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/widgets.dart' show BuildContext;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -18,6 +19,7 @@ import 'package:share_plus/share_plus.dart';
 
 import 'api_service.dart';
 import 'book_session.dart';
+import 'page_capture.dart';
 
 /// One printed line: its cells (one for text lines, one per column for
 /// table rows, column 0 = right-most) and whether it is a bullet item.
@@ -61,8 +63,9 @@ class ExportBlock {
 class ExportPage {
   const ExportPage(this.header, this.text, {this.blocks = const []});
 
+  /// The page header in exports is just its number.
   factory ExportPage.of(BookPage page) =>
-      ExportPage(page.header, page.text, blocks: ExportBlock.ofResult(page.result));
+      ExportPage('${page.number}', page.text, blocks: ExportBlock.ofResult(page.result));
 
   final String header;
 
@@ -103,35 +106,21 @@ Future<Uint8List> buildBookPdf(List<ExportPage> pages,
     theme: pw.ThemeData.withFont(
         base: regular, bold: bold, fontFallback: [pw.Font.helvetica(), pw.Font.helveticaBold()]),
   );
-  const gold = PdfColor.fromInt(0xFFD4AF37);
-  const navy = PdfColor.fromInt(0xFF0F2027);
-
   doc.addPage(
     pw.MultiPage(
       pageFormat: PdfPageFormat.a4,
-      margin: const pw.EdgeInsets.fromLTRB(40, 40, 40, 48),
+      margin: const pw.EdgeInsets.fromLTRB(40, 30, 40, 40),
       textDirection: pw.TextDirection.rtl,
-      header: (context) => pw.Container(
-        alignment: pw.Alignment.centerLeft,
-        margin: const pw.EdgeInsets.only(bottom: 12),
-        child: pw.Text('$title  -  ${context.pageNumber}/${context.pagesCount}',
-            textDirection: pw.TextDirection.ltr,
-            style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey600)),
-      ),
       build: (context) => [
-        for (final page in pages) ...[
-          pw.Container(
-            width: double.infinity,
-            margin: const pw.EdgeInsets.only(top: 14, bottom: 8),
-            padding: const pw.EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-            decoration: const pw.BoxDecoration(
-              color: navy,
-              borderRadius: pw.BorderRadius.all(pw.Radius.circular(4)),
-            ),
+        for (final (i, page) in pages.indexed) ...[
+          // Every book page on a new sheet; its header is just the number.
+          if (i > 0) pw.NewPage(),
+          pw.Center(
             child: pw.Text(page.header,
                 textDirection: pw.TextDirection.ltr,
-                style: pw.TextStyle(color: gold, fontWeight: pw.FontWeight.bold, fontSize: 12)),
+                style: const pw.TextStyle(fontSize: 11, color: PdfColors.grey700)),
           ),
+          pw.SizedBox(height: 14),
           if (page.blocks.isEmpty)
             for (final line in page.text.split('\n'))
               line.trim().isEmpty
@@ -219,6 +208,33 @@ List<pw.Widget> _pdfBlock(ExportBlock block) {
   }
 }
 
+/// Builds the book PDF from page images rendered by the app (see
+/// page_capture.dart): every book page starts on a new A4 sheet, long pages
+/// continue on the next sheet, and the only header is the page number.
+Future<Uint8List> buildImagePdf(List<List<Uint8List>> pages, {String title = 'HarfScan Book'}) {
+  final doc = pw.Document(title: title, creator: 'HarfScan');
+  for (var i = 0; i < pages.length; i++) {
+    for (final slice in pages[i]) {
+      doc.addPage(pw.Page(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.fromLTRB(40, 30, 40, 40),
+        build: (context) => pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+          children: [
+            pw.Center(
+              child: pw.Text('${i + 1}',
+                  style: const pw.TextStyle(fontSize: 11, color: PdfColors.grey700)),
+            ),
+            pw.SizedBox(height: 14),
+            pw.Image(pw.MemoryImage(slice), fit: pw.BoxFit.fitWidth, alignment: pw.Alignment.topCenter),
+          ],
+        ),
+      ));
+    }
+  }
+  return doc.save();
+}
+
 // --------------------------------------------------------------------------
 // Word (.docx)
 // --------------------------------------------------------------------------
@@ -237,9 +253,10 @@ String _rtlParagraph(String text) => '<w:p><w:pPr><w:bidi/><w:jc w:val="right"/>
     '<w:rtl/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>'
     '<w:t xml:space="preserve">${_xmlEscape(text)}</w:t></w:r></w:p>';
 
-String _headerParagraph(String text) => '<w:p><w:pPr><w:spacing w:before="240" w:after="120"/>'
-    '<w:shd w:val="clear" w:color="auto" w:fill="0F2027"/></w:pPr>'
-    '<w:r><w:rPr><w:b/><w:color w:val="D4AF37"/><w:sz w:val="24"/></w:rPr>'
+/// Page number at the top of each book page (centred, small, grey).
+String _headerParagraph(String text) => '<w:p><w:pPr><w:jc w:val="center"/>'
+    '<w:spacing w:before="0" w:after="200"/></w:pPr>'
+    '<w:r><w:rPr><w:color w:val="666666"/><w:sz w:val="22"/></w:rPr>'
     '<w:t xml:space="preserve">${_xmlEscape(text)}</w:t></w:r></w:p>';
 
 const _pageBreak = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
@@ -341,18 +358,27 @@ class ExportService {
   const ExportService._();
 
   /// Builds the file for the whole book, saves it in the app's documents
-  /// folder and opens the share sheet. Returns the saved file.
-  static Future<File> exportBook(BookSession session, ExportFormat format) async {
+  /// folder and opens the share sheet. Returns the saved file, or null if
+  /// the user left the export screen.
+  ///
+  /// The PDF is made from the pages as the app draws them (same fonts and
+  /// layout as on screen); if that fails, from the text with the bundled
+  /// Naskh font.
+  static Future<File?> exportBook(BuildContext context, BookSession session, ExportFormat format) async {
     final pages = session.pages.map(ExportPage.of).toList();
     final Uint8List bytes;
     final String extension;
     switch (format) {
       case ExportFormat.pdf:
-        bytes = await buildBookPdf(
-          pages,
-          regularFont: await rootBundle.load('assets/fonts/NotoNaskhArabic-Regular.ttf'),
-          boldFont: await rootBundle.load('assets/fonts/NotoNaskhArabic-Bold.ttf'),
-        );
+        final images = await capturePages(context, session.pages);
+        bytes = images != null && images.length == pages.length
+            ? await buildImagePdf(images, title: session.title)
+            : await buildBookPdf(
+                pages,
+                title: session.title,
+                regularFont: await rootBundle.load('assets/fonts/NotoNaskhArabic-Regular.ttf'),
+                boldFont: await rootBundle.load('assets/fonts/NotoNaskhArabic-Bold.ttf'),
+              );
         extension = 'pdf';
       case ExportFormat.docx:
         bytes = buildBookDocx(pages);
@@ -360,12 +386,13 @@ class ExportService {
     }
     final dir = await getApplicationDocumentsDirectory();
     final stamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
-    final file = File('${dir.path}/HarfScan_Book_$stamp.$extension');
+    final name = session.title.replaceAll(RegExp(r'[^\w\u0600-\u06FF -]'), '').trim();
+    final file = File('${dir.path}/${name.isEmpty ? 'HarfScan_Book' : name}_$stamp.$extension');
     await file.writeAsBytes(bytes, flush: true);
 
     await SharePlus.instance.share(ShareParams(
       files: [XFile(file.path)],
-      subject: 'HarfScan book (${session.pageCount} pages)',
+      subject: '${session.title} (${session.pageCount} pages)',
     ));
     return file;
   }

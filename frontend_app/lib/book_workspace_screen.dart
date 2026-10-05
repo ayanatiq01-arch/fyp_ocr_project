@@ -1,7 +1,7 @@
 // book_workspace_screen.dart
 //
-// Screen 3 - Multi-Page Book Workspace & Exporter.
-// Every extracted page is appended to one master document:
+// Book Workspace & Exporter for one book of the library.
+// Every extracted page is appended to the book:
 //
 //     === Page 1 ===
 //     [text]
@@ -37,6 +37,40 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
   bool _exporting = false;
 
   BookSession get _session => widget.session;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.settings.lastScreen = 'workspace'; // reopen here next time
+  }
+
+  @override
+  void dispose() {
+    widget.settings.lastScreen = 'home';
+    super.dispose();
+  }
+
+  Future<void> _rename() async {
+    final controller = TextEditingController(text: _session.title);
+    final title = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: HarfColors.slate,
+        title: const Text('Rename book'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text('Save')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (title != null) _session.rename(title);
+  }
 
   Future<void> _scanNextPage() async {
     final source = await showModalBottomSheet<ImageSource>(
@@ -75,8 +109,8 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
     if (_session.isEmpty) return;
     setState(() => _exporting = true);
     try {
-      final file = await ExportService.exportBook(_session, format);
-      if (!mounted) return;
+      final file = await ExportService.exportBook(context, _session, format);
+      if (!mounted || file == null) return;
       ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Saved ${file.uri.pathSegments.last}')));
     } catch (e) {
@@ -110,7 +144,17 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
       builder: (context, _) => Scaffold(
         extendBodyBehindAppBar: true,
         appBar: AppBar(
-          title: Text('Book Workspace (${_session.pageCount})'),
+          title: GestureDetector(
+            onTap: _rename,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(_session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text('${_session.pageCount} ${_session.pageCount == 1 ? 'page' : 'pages'}  ·  tap to rename',
+                    style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+          ),
           actions: [
             IconButton(
               tooltip: 'Export as PDF',

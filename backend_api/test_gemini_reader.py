@@ -3,10 +3,13 @@
 Run from backend_api/:  venv\\Scripts\\python -m unittest test_gemini_reader -v
 """
 import json
+import time
 import unittest
 
 import numpy as np
 
+import ocr_pipeline
+from unittest.mock import patch
 from ocr_pipeline import (GeminiPageReader, blocks_from_gemini, blocks_to_markdown,
                           md_escape, script_language)
 
@@ -92,6 +95,8 @@ def quota_error():
 
 
 class FakeHttp:
+    """Replies per model from a script; an entry may be (delay_seconds, response)."""
+
     def __init__(self, script):
         self.script = script
         self.calls = []
@@ -99,7 +104,11 @@ class FakeHttp:
     def post(self, url, json=None, timeout=None, headers=None):
         model = url.split("/models/")[1].split(":")[0]
         self.calls.append(model)
-        return self.script[model].pop(0)
+        item = self.script[model].pop(0)
+        if isinstance(item, tuple):
+            time.sleep(item[0])
+            item = item[1]
+        return item
 
 
 IMAGE = np.full((300, 200, 3), 255, np.uint8)
@@ -125,12 +134,29 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(r._http.calls, ["m1", "m2", "m2"])
         self.assertEqual(r.last_model, "m2")
 
-    def test_overloaded_model_is_retried_once_then_skipped(self):
+    def test_overloaded_model_hands_over_at_once(self):
         busy = {"error": {"code": 503, "message": "high demand"}}
-        r = reader({"m1": [FakeResponse(503, busy), FakeResponse(503, busy)],
-                    "m2": [FakeResponse(200, reply(PAGE))]})
+        r = reader({"m1": [FakeResponse(503, busy)], "m2": [FakeResponse(200, reply(PAGE))]})
+        t = time.time()
         r.read_page(IMAGE)
-        self.assertEqual(r._http.calls, ["m1", "m1", "m2"])
+        self.assertEqual(r._http.calls, ["m1", "m2"])        # no retry pause
+        self.assertLess(time.time() - t, 1.0)
+
+    def test_slow_model_gets_a_parallel_backup(self):
+        r = reader({"m1": [(3.0, FakeResponse(200, reply(PAGE)))],
+                    "m2": [FakeResponse(200, reply(PAGE))]})
+        with patch.object(ocr_pipeline, "GEMINI_HEDGE_AFTER", 0.3):
+            t = time.time()
+            r.read_page(IMAGE)
+        self.assertEqual(r.last_model, "m2")                  # backup answered first
+        self.assertLess(time.time() - t, 2.0)
+
+    def test_cut_off_answer_is_not_used(self):
+        cut = reply(PAGE)
+        cut["candidates"][0]["finishReason"] = "MAX_TOKENS"
+        r = reader({"m1": [FakeResponse(200, cut)], "m2": [FakeResponse(200, reply(PAGE))]})
+        r.read_page(IMAGE)
+        self.assertEqual(r.last_model, "m2")
 
     def test_no_model_left_raises(self):
         r = reader({"m1": [FakeResponse(429, quota_error())],

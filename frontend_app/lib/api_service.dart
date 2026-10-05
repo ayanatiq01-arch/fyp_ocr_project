@@ -44,6 +44,8 @@ class BBox {
       );
 
   final double x1, y1, x2, y2;
+
+  List<double> toJson() => [x1, y1, x2, y2];
 }
 
 /// One engine's reading of a cell (kept to show how the router decided).
@@ -60,6 +62,8 @@ class EngineCandidate {
 
   /// 0-100.
   final double confidence;
+
+  Map<String, dynamic> toJson() => {'text': text, 'confidence': confidence};
 }
 
 /// One auto-cropped text box: a line, part of a line or a table cell.
@@ -106,6 +110,16 @@ class OcrCell {
 
   /// True once the backend has read this cell.
   bool get isRead => candidates.isNotEmpty;
+
+  Map<String, dynamic> toJson() => {
+        'bbox': bbox.toJson(),
+        'column': column,
+        'text': text,
+        'language': language,
+        'engine': engine,
+        'confidence': confidence,
+        'candidates': candidates.map((k, v) => MapEntry(k, v.toJson())),
+      };
 }
 
 /// Cells on one printed line, in right-to-left reading order.
@@ -125,6 +139,12 @@ class OcrRow {
 
   /// Mutable: cells are replaced one by one while the page is streamed.
   final List<OcrCell> cells;
+
+  Map<String, dynamic> toJson() => {
+        'bbox': bbox.toJson(),
+        'is_bullet': isBullet,
+        'cells': [for (final c in cells) c.toJson()],
+      };
 }
 
 /// A layout block: paragraph, title, list or table.
@@ -163,6 +183,15 @@ class OcrBlock {
   final List<OcrRow> rows;
 
   bool get isTable => type == 'Table';
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'type': type,
+        'bbox': bbox.toJson(),
+        'columns': columns,
+        'language': language,
+        'rows': [for (final r in rows) r.toJson()],
+      };
 
   /// Text of one row: table columns joined by TAB, otherwise by spaces.
   String rowText(OcrRow row) {
@@ -241,6 +270,21 @@ class OcrResult {
   Iterable<OcrCell> get cells => blocks.expand((b) => b.rows).expand((r) => r.cells);
 
   int get readCells => cells.where((c) => c.isRead).length;
+
+  /// Same shape as the backend's JSON, so [OcrResult.fromJson] reads it back
+  /// (used to save books on the phone).
+  Map<String, dynamic> toJson() => {
+        'request_id': requestId,
+        'image': {'width': imageWidth, 'height': imageHeight},
+        'rotation': rotation,
+        'skew_angle': skewAngle,
+        'layout_engine': layoutEngine,
+        'blocks': [for (final b in blocks) b.toJson()],
+        'formatted_text': formattedText,
+        'processing_ms': processingMs,
+        'ai_correction': aiCorrection,
+        'total_cells': totalCells,
+      };
 
   /// Page text built from what has been read so far (same rules as the
   /// backend: blank line between blocks, TAB between table columns).

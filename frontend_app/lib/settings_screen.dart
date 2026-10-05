@@ -1,20 +1,21 @@
 // settings_screen.dart
 //
-// Settings: OCR server address (with a connection test), review
-// highlighting of low-confidence words, the current book, and About.
-// Everything is remembered between launches (see app_settings.dart).
+// Settings: script of the book (Urdu / Arabic / Mixed), how the app works,
+// server connection, review highlighting, account and About. Everything is
+// remembered between launches (see app_settings.dart).
 
 import 'package:flutter/material.dart';
 
 import 'app_settings.dart';
+import 'auth_service.dart';
 import 'book_session.dart';
 import 'theme.dart';
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key, required this.settings, required this.session});
+  const SettingsScreen({super.key, required this.settings, required this.auth});
 
   final AppSettings settings;
-  final BookSession session;
+  final AuthService auth;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -41,7 +42,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _saving = false);
     final ok = _settings.serverOnline == true;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(ok ? 'Connected to the OCR server' : 'Server not reachable at ${_settings.serverUrl}')));
+        content: Text(ok ? 'Connected to the server' : 'Server not reachable at ${_settings.serverUrl}')));
   }
 
   Future<void> _findServer() async {
@@ -54,21 +55,66 @@ class _SettingsScreenState extends State<SettingsScreen> {
             : 'No HarfScan server found on this Wi-Fi')));
   }
 
-  Future<void> _clearBook() async {
-    final ok = await showDialog<bool>(
+  Future<void> _signOut() async {
+    // Back to the home page first; once its transition has finished, the
+    // home page is replaced by the login page.
+    Navigator.of(context).popUntil((route) => route.isFirst);
+    await Future<void>.delayed(const Duration(milliseconds: 450));
+    await widget.auth.signOut();
+  }
+
+  Future<void> _changePassword() async {
+    final current = TextEditingController();
+    final next = TextEditingController();
+    String? error;
+    await showDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: HarfColors.slate,
-        title: const Text('Start a new book?'),
-        content: Text('All ${widget.session.pageCount} page(s) in the workspace will be removed. '
-            'Export them first if you need them.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Clear book')),
-        ],
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          backgroundColor: HarfColors.slate,
+          title: const Text('Change password'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                  controller: current,
+                  obscureText: true,
+                  decoration: const InputDecoration(labelText: 'Current password')),
+              TextField(
+                  controller: next,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                      labelText: 'New password', helperText: 'At least 6 characters, with a number')),
+              if (error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Text(error!, style: const TextStyle(color: Colors.redAccent)),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () async {
+                final problem = await widget.auth.changePassword(current.text, next.text);
+                if (problem != null) {
+                  setDialog(() => error = problem);
+                  return;
+                }
+                if (ctx.mounted) Navigator.pop(ctx);
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(const SnackBar(content: Text('Password changed')));
+                }
+              },
+              child: const Text('Change'),
+            ),
+          ],
+        ),
       ),
     );
-    if (ok == true) widget.session.clear();
+    current.dispose();
+    next.dispose();
   }
 
   @override
@@ -79,27 +125,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
       body: HarfBackground(
         child: SafeArea(
           child: ListenableBuilder(
-            listenable: Listenable.merge([_settings, widget.session]),
+            listenable: Listenable.merge([_settings, widget.auth]),
             builder: (context, _) => ListView(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
               children: [
-                const SectionLabel('OCR server'),
+                const SectionLabel('Script of the book'),
+                for (final (lang, sample, subtitle) in const [
+                  (OcrLanguage.urdu, 'اردو', 'Nastaliq script'),
+                  (OcrLanguage.arabic, 'العربية', 'Naskh script'),
+                  (OcrLanguage.mixed, 'اردو + عربی', 'Urdu and Arabic on the same page'),
+                ])
+                  _ScriptCard(
+                    language: lang,
+                    sample: sample,
+                    subtitle: subtitle,
+                    selected: _settings.language == lang,
+                    onTap: () => _settings.language = lang,
+                  ),
+                const SizedBox(height: 20),
+                const SectionLabel('How it works'),
+                const _HowItWorks(),
+                const SizedBox(height: 24),
+                const SectionLabel('Server'),
                 _serverCard(),
                 const SizedBox(height: 24),
                 const SectionLabel('Review'),
                 _reviewCard(),
                 const SizedBox(height: 24),
-                const SectionLabel('Book'),
-                Card(
-                  margin: EdgeInsets.zero,
-                  child: ListTile(
-                    leading: const Icon(Icons.delete_sweep, color: HarfColors.gold),
-                    title: const Text('Start a new book'),
-                    subtitle: Text('${widget.session.pageCount} page(s) in the current workspace'),
-                    enabled: !widget.session.isEmpty,
-                    onTap: _clearBook,
-                  ),
-                ),
+                const SectionLabel('Account'),
+                _accountCard(),
                 const SizedBox(height: 24),
                 const SectionLabel('About'),
                 _aboutCard(),
@@ -177,8 +231,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 10),
             Text(
-              'Run the backend on your PC and keep the phone on the same Wi-Fi. '
-              'Use the PC\'s Wi-Fi IP address with port 8000.',
+              'The server runs on your PC (start_server.bat). Keep the phone on the same Wi-Fi; '
+              'the app finds the server by itself if its address changes.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ],
@@ -196,23 +250,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: Column(
           children: [
             SwitchListTile(
-              value: _settings.aiCorrect,
-              onChanged: (v) => _settings.aiCorrect = v,
-              activeThumbColor: HarfColors.gold,
-              secondary: const Icon(Icons.auto_awesome, color: HarfColors.gold),
-              title: const Text('Gemini AI reading'),
-              subtitle: const Text('Gemini reads the whole page: text, line boxes and layout '
-                  '(needs internet on the server). Off, or if Gemini is unavailable: '
-                  'UTRNet + PaddleOCR on the server'),
-            ),
-            const Divider(height: 1),
-            SwitchListTile(
               value: _settings.highlightLowConfidence,
               onChanged: (v) => _settings.highlightLowConfidence = v,
               activeThumbColor: HarfColors.gold,
               secondary: const Icon(Icons.highlight, color: HarfColors.gold),
               title: const Text('Highlight uncertain words'),
-              subtitle: const Text('Gold background on words the OCR is unsure about'),
+              subtitle: const Text('Gold background on words the reader is unsure about'),
             ),
             ListTile(
               enabled: _settings.highlightLowConfidence,
@@ -236,6 +279,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _accountCard() {
+    final user = widget.auth.user;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Column(
+        children: [
+          ListTile(
+            leading: CircleAvatar(
+              backgroundColor: HarfColors.gold,
+              foregroundColor: HarfColors.navy,
+              child: Text((user?.name.isNotEmpty ?? false) ? user!.name[0].toUpperCase() : '?'),
+            ),
+            title: Text(user?.name ?? ''),
+            subtitle: Text(user?.email ?? ''),
+          ),
+          const Divider(height: 1),
+          ListTile(
+            leading: const Icon(Icons.password, color: HarfColors.gold),
+            title: const Text('Change password'),
+            onTap: _changePassword,
+          ),
+          ListTile(
+            leading: const Icon(Icons.logout, color: HarfColors.gold),
+            title: const Text('Sign out'),
+            subtitle: const Text('Your books stay saved on this phone'),
+            onTap: _signOut,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _aboutCard() => Card(
         margin: EdgeInsets.zero,
         child: Padding(
@@ -251,18 +326,116 @@ class _SettingsScreenState extends State<SettingsScreen> {
               for (final line in const [
                 'Urdu: UTRNet (HRNet + BiLSTM + CTC)',
                 'Arabic: PaddleOCR PP-OCRv5 Arabic',
-                'Text detection: PaddleOCR PP-OCRv5',
-                'Layout: LayoutParser + confidence routing',
-                'AI reading: Google Gemini Flash (vision)',
+                'Text detection, layout and confidence routing',
+                'Book export: PDF and Word',
               ])
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
                   child: Text('• $line', style: Theme.of(context).textTheme.bodySmall),
                 ),
               const SizedBox(height: 8),
-              Text('Version 2.5.0', style: Theme.of(context).textTheme.bodySmall),
+              Text('Version 3.0.1', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ),
       );
+}
+
+class _ScriptCard extends StatelessWidget {
+  const _ScriptCard({
+    required this.language,
+    required this.sample,
+    required this.subtitle,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final OcrLanguage language;
+  final String sample;
+  final String subtitle;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+        side: BorderSide(
+            color: selected ? HarfColors.brightGold : HarfColors.gold.withValues(alpha: 0.35),
+            width: selected ? 2 : 1),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off,
+                  color: HarfColors.gold),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(language.label,
+                        style: const TextStyle(
+                            fontSize: 17, fontWeight: FontWeight.w600, color: HarfColors.brightGold)),
+                    Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
+                  ],
+                ),
+              ),
+              Text(sample,
+                  textDirection: TextDirection.rtl,
+                  style: scriptStyle(language == OcrLanguage.arabic ? 'arabic' : 'urdu', size: 22)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HowItWorks extends StatelessWidget {
+  const _HowItWorks();
+
+  @override
+  Widget build(BuildContext context) {
+    const steps = [
+      (Icons.translate, 'Choose the script of your book above'),
+      (Icons.photo_camera, 'Take or choose a photo of the page'),
+      (Icons.touch_app, 'Drag from the first word to the last word'),
+      (Icons.auto_stories, 'Add it to the book, then scan the next page'),
+      (Icons.ios_share, 'Export the whole book as PDF or Word'),
+    ];
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+        child: Column(
+          children: [
+            for (final (i, (icon, text)) in steps.indexed)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(children: [
+                  CircleAvatar(
+                    radius: 13,
+                    backgroundColor: HarfColors.gold.withValues(alpha: 0.2),
+                    child: Text('${i + 1}',
+                        style: const TextStyle(
+                            fontSize: 12, color: HarfColors.brightGold, fontWeight: FontWeight.w700)),
+                  ),
+                  const SizedBox(width: 12),
+                  Icon(icon, size: 20, color: HarfColors.gold),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(text, style: Theme.of(context).textTheme.bodyMedium)),
+                ]),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 }

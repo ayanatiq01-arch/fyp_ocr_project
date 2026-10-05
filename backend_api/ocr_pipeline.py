@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import sys
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -105,7 +106,13 @@ GEMINI_MODELS = [m.strip() for m in os.getenv(
 GEMINI_MAX_SIDE = int(os.getenv("GEMINI_MAX_SIDE", "2000"))
 # Gemini gives no per-word score; its text is reported with this confidence.
 GEMINI_CONFIDENCE = 0.99
-GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "240"))  # seconds per request
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "60"))  # seconds for the whole page
+# A model that has not answered after this many seconds gets the next model
+# as a parallel backup (first good answer wins).
+GEMINI_HEDGE_AFTER = float(os.getenv("GEMINI_HEDGE_AFTER", "5"))
+# Passes over all models when they are only overloaded (503), before the
+# page is read by the (much slower) local OCR instead.
+GEMINI_ROUNDS = int(os.getenv("GEMINI_ROUNDS", "3"))
 # Gemini 3 models think before answering; "low" keeps a page at ~15-60 s.
 GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low")
 
@@ -473,39 +480,102 @@ class GeminiPageReader:
                 "thinkingConfig": {"thinkingLevel": GEMINI_THINKING},
             },
         }
-        data = self._post(body)
-        answer = "".join(p.get("text", "") for p in
-                         data["candidates"][0]["content"].get("parts", []))
-        return json.loads(answer)
+        return self._post(body, self._parse_page)
 
-    def _post(self, body: dict) -> dict:
-        """POST to the first model that has quota left and is not overloaded."""
-        errors = []
-        for model in self.models:
-            if self._resting.get(model, 0) > time.time():
-                continue                                   # daily quota used up
-            resp = None
-            for attempt in range(2):
-                resp = self._http.post(self.URL.format(model=model), json=body,
-                                       timeout=GEMINI_TIMEOUT,
-                                       headers={"x-goog-api-key": self.api_key})
-                if resp.status_code == 200:
-                    self.last_model = model
-                    return resp.json()
-                if resp.status_code == 429:
-                    wait = self._retry_delay(resp)
-                    if "PerDay" in resp.text or wait > 60:
-                        self._resting[model] = time.time() + max(wait, 600)
-                        logger.warning("Gemini %s: daily free quota used up", model)
-                        break                              # next model
-                    time.sleep(wait or 5)                  # per-minute limit: wait, retry
-                    continue
-                if resp.status_code in (500, 503) and attempt == 0:
-                    time.sleep(3)                          # overloaded: one retry
-                    continue
+    @staticmethod
+    def _parse_page(data: dict) -> dict:
+        """The page JSON of a reply; raises if the answer is cut off or not
+        valid JSON (that model's answer is then not used)."""
+        cand = data["candidates"][0]
+        reason = cand.get("finishReason", "STOP")
+        if reason != "STOP":
+            raise RuntimeError(f"answer incomplete ({reason})")
+        answer = "".join(p.get("text", "") for p in cand["content"].get("parts", []))
+        page = json.loads(answer)
+        if not isinstance(page, dict) or not isinstance(page.get("blocks"), list):
+            raise RuntimeError("answer has no blocks")
+        return page
+
+    def _post(self, body: dict, parse):
+        """Sends the request and returns ``parse(reply)`` of the first good answer.
+
+        Speed: Google's Flash models are often overloaded, so a request is not
+        retried after a pause. A model that fails (busy, quota, bad answer)
+        hands over to the next model at once, and a model that has not
+        answered after GEMINI_HEDGE_AFTER seconds gets the next model as a
+        parallel backup - whichever answers first is used.
+        """
+        deadline = time.time() + GEMINI_TIMEOUT
+        errors: List[str] = []
+        # Overloaded models often answer a few seconds later: go round the
+        # models again (until the deadline) before giving up.
+        for round_no in range(GEMINI_ROUNDS):
+            models = [m for m in self.models if self._resting.get(m, 0) <= time.time()]
+            if not models:
+                break                                  # daily quota used up everywhere
+            if round_no:
+                time.sleep(1.5)
+            if time.time() + 5 > deadline:
                 break
-            errors.append(f"{model}: HTTP {getattr(resp, 'status_code', '?')}")
-        raise RuntimeError("no Gemini model available (" + "; ".join(errors or ["all resting"]) + ")")
+            try:
+                return self._post_round(models, body, parse, deadline, errors)
+            except RuntimeError:
+                continue
+        raise RuntimeError("no Gemini model available (" + "; ".join(errors[-5:] or ["daily quota used up"]) + ")")
+
+    def _post_round(self, models: List[str], body: dict, parse, deadline: float,
+                    errors: List[str]):
+        """One pass over ``models`` (hedged, see :meth:`_post`)."""
+        replies: "queue.Queue[Tuple[str, object, Optional[Exception]]]" = queue.Queue()
+
+        def call(model: str) -> None:
+            try:
+                replies.put((model, parse(self._call(model, body)), None))
+            except Exception as exc:  # reported to the waiting loop
+                replies.put((model, None, exc))
+
+        started, pending = 0, 0
+
+        def start_next() -> bool:
+            nonlocal started, pending
+            if started >= len(models):
+                return False
+            threading.Thread(target=call, args=(models[started],), daemon=True).start()
+            started += 1
+            pending += 1
+            return True
+
+        start_next()
+        while pending:
+            wait = min(GEMINI_HEDGE_AFTER, deadline - time.time())
+            if wait <= 0:
+                break
+            try:
+                model, result, error = replies.get(timeout=wait)
+            except queue.Empty:
+                start_next()                       # slow answer: start a backup model
+                continue
+            pending -= 1
+            if error is None:
+                self.last_model = model
+                return result
+            errors.append(f"{model}: {str(error)[:80]}")
+            if not pending:
+                start_next()                       # failed: next model right away
+        raise RuntimeError("round failed")
+
+    def _call(self, model: str, body: dict) -> dict:
+        """One request to one model; raises on any non-200 reply."""
+        resp = self._http.post(self.URL.format(model=model), json=body, timeout=GEMINI_TIMEOUT,
+                               headers={"x-goog-api-key": self.api_key})
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 429:
+            wait = self._retry_delay(resp)
+            if "PerDay" in resp.text or wait > 60:
+                self._resting[model] = time.time() + max(wait, 600)
+                logger.warning("Gemini %s: daily free quota used up", model)
+        raise RuntimeError(f"HTTP {resp.status_code}")
 
     @staticmethod
     def _retry_delay(resp) -> float:

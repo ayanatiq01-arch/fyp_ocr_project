@@ -80,6 +80,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
   String _error = '';
   OcrResult? _result;
   List<_Word> _words = const [];
+  List<Rect> _boxes = const []; // line / table-cell boxes, shown on the photo
 
   // Selection = words [min(_anchor,_focus) .. max(_anchor,_focus)].
   int? _anchor;
@@ -111,12 +112,13 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       _phase = _Phase.reading;
       _result = null;
       _words = const [];
+      _boxes = const [];
       _anchor = _focus = null;
       _stage = '';
     });
     _scan = widget.settings.api
         .scanStream(widget.image,
-            language: widget.session.language.apiValue, aiCorrect: widget.settings.aiCorrect)
+            language: widget.settings.language.apiValue, aiCorrect: widget.settings.aiCorrect)
         .listen(
       (event) {
         if (!mounted) return;
@@ -135,6 +137,10 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
             case DoneEvent(:final result):
               _result = result;
               _words = _buildWords(result);
+              _boxes = [
+                for (final c in result.cells)
+                  if (c.text.isNotEmpty) Rect.fromLTRB(c.bbox.x1, c.bbox.y1, c.bbox.x2, c.bbox.y2),
+              ];
               _phase = _Phase.selecting;
           }
         });
@@ -193,8 +199,8 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
   }
 
   static List<Rect> _splitBox(Rect box, List<String> parts, int rotation) {
-    // A sideways photo (90/270, or a tall line box from Gemini, which reads
-    // the photo as it is): text runs vertically - keep the whole box for each
+    // A sideways photo (90/270, or a tall line box when the page was read
+    // as photographed): text runs vertically - keep the whole box for each
     // word rather than guessing.
     final vertical = rotation % 180 != 0 || (parts.length > 1 && box.height > box.width * 1.5);
     if (parts.length == 1 || vertical) return [for (final _ in parts) box];
@@ -368,7 +374,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
     return Scaffold(
       extendBodyBehindAppBar: true,
       appBar: AppBar(
-        title: Text(_phase == _Phase.selecting ? 'Select text' : 'Reading page'),
+        title: Text(_phase == _Phase.selecting ? 'Select text' : 'Finding text'),
         actions: [
           if (_phase == _Phase.selecting)
             TextButton(onPressed: _selectAll, child: const Text('Select all')),
@@ -421,6 +427,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
                 painter: selecting
                     ? _SelectionPainter(
                         words: _words,
+                        boxes: _boxes,
                         lo: _lo,
                         hi: _hi,
                         scale: scale,
@@ -488,7 +495,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       mainAxisSize: MainAxisSize.min,
       children: [
         LinearProgressIndicator(
-          value: total == 0 || _stage == 'ai_reading' ? null : read / total,
+          value: total == 0 || _stage != 'local_ocr' ? null : read / total,
           color: HarfColors.brightGold,
           backgroundColor: HarfColors.slate,
           minHeight: 6,
@@ -496,14 +503,8 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
         ),
         const SizedBox(height: 10),
         Text(_stage == 'searching'
-            ? 'Server not reachable - searching the Wi-Fi network...'
-            : _stage == 'ai_reading'
-            ? 'Gemini AI is reading the page...'
-            : total == 0 && _stage == 'local_ocr'
-                ? 'Gemini unavailable - reading with the local OCR...'
-                : total == 0
-                ? 'Finding text on the page...'
-                : 'Reading ${widget.session.language.label} text  $read / $total'),
+            ? 'Connecting to the server...'
+            : 'Finding text...'),
         const SizedBox(height: 4),
         TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
       ],
@@ -559,7 +560,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
                 _selectedText.replaceAll('\t', '  |  '),
                 textDirection: TextDirection.rtl,
                 textAlign: TextAlign.right,
-                style: scriptStyle(widget.session.language == OcrLanguage.arabic ? 'arabic' : 'urdu',
+                style: scriptStyle(widget.settings.language == OcrLanguage.arabic ? 'arabic' : 'urdu',
                     size: 17),
               ),
             ),
@@ -608,10 +609,12 @@ class _ReadingPainter extends CustomPainter {
       old.result != result || old.read != read || old.scale != scale;
 }
 
-/// Selectable words (faint) and the selection (gold) with its two handles.
+/// The text boxes found on the page (gold outlines), the selectable words
+/// and the selection (gold) with its two handles.
 class _SelectionPainter extends CustomPainter {
   _SelectionPainter({
     required this.words,
+    required this.boxes,
     required this.lo,
     required this.hi,
     required this.scale,
@@ -620,13 +623,26 @@ class _SelectionPainter extends CustomPainter {
   });
 
   final List<_Word> words;
+  final List<Rect> boxes;
   final int? lo, hi;
   final double scale;
   final Offset? start, end;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final idle = Paint()..color = Colors.white.withValues(alpha: 0.10);
+    final outline = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..color = HarfColors.brightGold.withValues(alpha: 0.85);
+    final shade = Paint()..color = HarfColors.gold.withValues(alpha: 0.10);
+    for (final r in boxes) {
+      final rect = RRect.fromRectAndRadius(
+          Rect.fromLTRB(r.left * scale, r.top * scale, r.right * scale, r.bottom * scale).inflate(1),
+          const Radius.circular(3));
+      canvas.drawRRect(rect, shade);
+      canvas.drawRRect(rect, outline);
+    }
+    final idle = Paint()..color = Colors.transparent;
     final selected = Paint()..color = HarfColors.brightGold.withValues(alpha: 0.42);
     for (var i = 0; i < words.length; i++) {
       final r = words[i].rect;
@@ -654,7 +670,7 @@ class _SelectionPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _SelectionPainter old) =>
-      old.lo != lo || old.hi != hi || old.words != words || old.scale != scale;
+      old.lo != lo || old.hi != hi || old.words != words || old.boxes != boxes || old.scale != scale;
 }
 
 /// Gold line sweeping over the photo while the page structure is detected.
