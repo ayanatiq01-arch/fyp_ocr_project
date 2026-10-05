@@ -57,9 +57,18 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
 # Keep uploaded images after processing (useful for collecting test data).
 KEEP_UPLOADS = os.getenv("KEEP_UPLOADS", "0") == "1"
 
+from logging.handlers import RotatingFileHandler
+
+# Log to the console and to backend_api/server.log (git-ignored, 2 x 1 MB),
+# so a problem the phone reported can be looked up afterwards.
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(Path(__file__).resolve().parent / "server.log",
+                            maxBytes=1_000_000, backupCount=1, encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("ocr-api")
 

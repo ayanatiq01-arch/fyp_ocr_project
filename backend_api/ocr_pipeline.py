@@ -565,11 +565,6 @@ class GeminiPageReader:
             pending -= 1
             if error is None:
                 self.last_model = model
-                # Speed: the model that answered is asked first next time
-                # (busy models are then only the backups).
-                if model in self.models:
-                    self.models.remove(model)
-                    self.models.insert(0, model)
                 return result
             errors.append(f"{model}: {str(error)[:80]}")
             if not pending:

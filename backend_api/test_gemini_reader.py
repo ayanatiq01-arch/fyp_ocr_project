@@ -151,14 +151,6 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(r.last_model, "m2")                  # backup answered first
         self.assertLess(time.time() - t, 2.0)
 
-    def test_model_that_answered_is_asked_first_next_time(self):
-        busy = {"error": {"code": 503, "message": "high demand"}}
-        r = reader({"m1": [FakeResponse(503, busy)],
-                    "m2": [FakeResponse(200, reply(PAGE)), FakeResponse(200, reply(PAGE))]})
-        r.read_page(IMAGE)
-        r.read_page(IMAGE)
-        self.assertEqual(r._http.calls, ["m1", "m2", "m2"])   # m2 first the second time
-
     def test_cut_off_answer_is_not_used(self):
         cut = reply(PAGE)
         cut["candidates"][0]["finishReason"] = "MAX_TOKENS"
