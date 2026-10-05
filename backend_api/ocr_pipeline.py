@@ -101,7 +101,11 @@ GEMINI_CORRECTION = os.getenv("GEMINI_CORRECTION", "1") != "0"
 # overloaded) the next one takes over.
 GEMINI_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,"
-                     "gemini-3.5-flash,gemini-3-flash-preview").split(",") if m.strip()]
+                     "gemini-3.5-flash,gemini-3-flash-preview,"
+                     # Last resort (own daily quota, ~5 s, but they may join
+                     # lines and drop ayah numbers): better than local OCR.
+                     "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.1-flash-lite"
+                     ).split(",") if m.strip()]
 # Long side of the photo sent to Gemini (pixels).
 GEMINI_MAX_SIDE = int(os.getenv("GEMINI_MAX_SIDE", "2000"))
 # Gemini gives no per-word score; its text is reported with this confidence.

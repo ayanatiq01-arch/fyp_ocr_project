@@ -128,7 +128,7 @@ With Gemini, the stream sends `{"event": "status", "stage": "ai_reading"}`, then
 | `PADDLE_ARABIC_MODEL` / `PADDLE_DET_MODEL` | `arabic_PP-OCRv5_mobile_rec` / `PP-OCRv5_mobile_det` | PaddleOCR 3.x model names |
 | `GEMINI_API_KEY` | — | Google AI Studio key; without it pages are read by the local OCR |
 | `GEMINI_CORRECTION` | `1` | `0` switches Gemini off for every request |
-| `GEMINI_MODELS` | `gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview` | Flash models tried in order (Gemini 1.5 Flash is retired) |
+| `GEMINI_MODELS` | `gemini-3.8-flash,…,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.1-flash-lite` | Models tried in order (Gemini 1.5 Flash is retired). The lite models come last: about 5 s and their own daily quota, but on a Quran page they joined the verse lines and dropped ayah numbers. Still far better than the local OCR. |
 | `GEMINI_MAX_SIDE` | `2000` | Long side (px) of the photo sent to Gemini |
 | `GEMINI_THINKING` | `low` | Gemini 3 thinking level |
 | `GEMINI_TIMEOUT` | `60` | Seconds for the whole page before falling back to local OCR |
