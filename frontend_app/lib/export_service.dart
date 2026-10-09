@@ -21,6 +21,7 @@ import 'package:share_plus/share_plus.dart';
 import 'api_service.dart';
 import 'book_session.dart';
 import 'page_capture.dart';
+import 'page_markdown.dart';
 
 /// One printed line: its cells (one for text lines, one per column for
 /// table rows, column 0 = right-most) and whether it is a bullet item.
@@ -45,6 +46,53 @@ class ExportBlock {
           ]),
       ].where((b) => b.rows.isNotEmpty).toList();
 
+  /// The blocks of page Markdown: '#' headings -> Title, '- ' items ->
+  /// List (bullets), '|' rows -> Table, other lines -> Text; a blank line
+  /// starts a new block.
+  static List<ExportBlock> ofMarkdown(String md) {
+    final blocks = <ExportBlock>[];
+    var type = '';
+    var rows = <ExportRow>[];
+    void flush() {
+      if (rows.isNotEmpty) blocks.add(ExportBlock(type, rows));
+      rows = <ExportRow>[];
+      type = '';
+    }
+
+    for (final raw in md.split('\n')) {
+      final t = raw.trim();
+      if (t.isEmpty || RegExp(r'^(\*{3,}|-{3,}|_{3,})$').hasMatch(t)) {
+        flush();
+        continue;
+      }
+      final String kind;
+      final ExportRow row;
+      if (t.startsWith('#')) {
+        kind = 'Title';
+        row = ExportRow([markdownToPlain(t)]);
+      } else if (t.startsWith('|')) {
+        if (RegExp(r'^\|?\s*:?-{3,}').hasMatch(t)) continue; // header rule
+        kind = 'Table';
+        row = ExportRow(t
+            .replaceAll(RegExp(r'^\||\|$'), '')
+            .split('|')
+            .map((c) => markdownToPlain(c.trim()))
+            .toList());
+      } else if (t.startsWith('- ') || t.startsWith('* ') || t.startsWith('+ ')) {
+        kind = 'List';
+        row = ExportRow([markdownToPlain(t.substring(2))], bullet: true);
+      } else {
+        kind = type == 'List' ? 'List' : 'Text';
+        row = ExportRow([markdownToPlain(t)]);
+      }
+      if (type.isNotEmpty && type != kind) flush();
+      type = kind;
+      rows.add(row);
+    }
+    flush();
+    return blocks;
+  }
+
   static List<String> _tableCells(OcrBlock block, OcrRow row) {
     final slots = List<String>.filled(block.columns < 1 ? 1 : block.columns, '');
     for (final c in row.cells) {
@@ -66,7 +114,10 @@ class ExportPage {
 
   /// The page header in exports is just its number.
   factory ExportPage.of(BookPage page) =>
-      ExportPage('${page.number}', page.text, blocks: ExportBlock.ofResult(page.result));
+      ExportPage('${page.number}', page.text,
+          blocks: page.result.isCorrected
+              ? ExportBlock.ofMarkdown(page.result.markdown)
+              : ExportBlock.ofResult(page.result));
 
   final String header;
 

@@ -16,6 +16,11 @@ rem opencv-python and opencv-contrib-python share the cv2 package; reinstall
 rem contrib last so its (superset) files are the ones on disk.
 venv\Scripts\python -m pip install --no-deps --force-reinstall opencv-contrib-python==4.10.0.84 || goto :error
 
+rem EasyOCR (Arabic recognition) without its opencv-python-headless dependency;
+rem its other dependencies are in requirements.txt. Its Arabic model is
+rem downloaded to %USERPROFILE%\.EasyOCR\model on the first start.
+venv\Scripts\python -m pip install --no-deps easyocr==1.7.2 || goto :error
+
 if not exist "UTRNet-High-Resolution-Urdu-Text-Recognition\saved_models\UTRNet-Large\best_norm_ED.pth" (
   echo.
   echo WARNING: UTRNet weights missing. Download UTRNet-Large from the link in

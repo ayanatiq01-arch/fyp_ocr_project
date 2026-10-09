@@ -221,6 +221,7 @@ class OcrResult {
     required this.processingMs,
     required this.totalCells,
     this.aiCorrection = 'off',
+    this.markdown = '',
   });
 
   factory OcrResult.fromJson(Map<String, dynamic> json) {
@@ -239,6 +240,7 @@ class OcrResult {
       formattedText: json['formatted_text'] as String? ?? '',
       processingMs: json['processing_ms'] as int? ?? 0,
       aiCorrection: json['ai_correction'] as String? ?? 'off',
+      markdown: json['markdown'] as String? ?? '',
       totalCells: json['total_cells'] as int? ??
           blocks.fold<int>(0, (n, b) => n + b.rows.fold<int>(0, (m, r) => m + r.cells.length)),
     );
@@ -258,12 +260,16 @@ class OcrResult {
   final String formattedText;
   final int processingMs;
 
-  /// Gemini model that read the page, "off" (local OCR), or
-  /// `failed: <reason>` (local OCR used because Gemini was unavailable).
+  /// Gemini model that corrected the rough draft, "off", or
+  /// `failed: <reason>` (rough draft only).
   final String aiCorrection;
 
-  /// True if the page was read by Gemini (not the local OCR engines).
-  bool get readByGemini => aiCorrection.startsWith('gemini');
+  /// The final page as Markdown from the server: corrected by the vision
+  /// model when [isCorrected], else the rough draft as Markdown.
+  final String markdown;
+
+  /// True if the vision model corrected the rough draft into [markdown].
+  bool get isCorrected => aiCorrection.startsWith('gemini') && markdown.trim().isNotEmpty;
 
   final int totalCells;
 
@@ -283,6 +289,7 @@ class OcrResult {
         'formatted_text': formattedText,
         'processing_ms': processingMs,
         'ai_correction': aiCorrection,
+        'markdown': markdown,
         'total_cells': totalCells,
       };
 
@@ -318,8 +325,8 @@ class CellEvent extends OcrEvent {
   final OcrCell cell;
 }
 
-/// The server moved to another stage: "ai_reading" = Gemini is reading the
-/// page; "local_ocr" = Gemini was unavailable, the local engines read it.
+/// The server moved to another stage: "ai_correcting" = the rough draft
+/// is done and the vision model is correcting it.
 class StatusEvent extends OcrEvent {
   const StatusEvent(this.stage);
   final String stage;

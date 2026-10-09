@@ -51,7 +51,7 @@ class PrintedPage extends StatelessWidget {
       color: Colors.white,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
       child: MarkdownPage(
-        markdown: pageMarkdown(page.result),
+        markdown: displayMarkdown(page.result),
         language: pageLanguage(page.result),
         paper: true,
       ),

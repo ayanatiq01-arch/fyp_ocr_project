@@ -81,7 +81,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
   StreamSubscription<OcrEvent>? _scan;
   _Phase _phase = _Phase.reading;
   bool _retried = false; // one automatic retry after finding the server again
-  String _stage = ''; // server stage: 'ai_reading' / 'local_ocr'
+  String _stage = ''; // 'ai_correcting' (vision model) or 'searching' (server)
   String _error = '';
   OcrResult? _result;
   List<_Word> _words = const [];
@@ -500,7 +500,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
       mainAxisSize: MainAxisSize.min,
       children: [
         LinearProgressIndicator(
-          value: total == 0 || _stage != 'local_ocr' ? null : read / total,
+          value: total == 0 || _stage == 'ai_correcting' ? null : read / total,
           color: HarfColors.brightGold,
           backgroundColor: HarfColors.slate,
           minHeight: 6,

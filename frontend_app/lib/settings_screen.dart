@@ -310,8 +310,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const SizedBox(height: 8),
               for (final line in const [
                 'Urdu: UTRNet (HRNet + BiLSTM + CTC)',
-                'Arabic: PaddleOCR PP-OCRv5 Arabic',
-                'Text detection, layout and confidence routing',
+                'Arabic: EasyOCR (local, open source)',
+                'Text detection, layout and AI correction to Markdown',
                 'Book export: PDF and Word',
               ])
                 Padding(
@@ -319,7 +319,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: Text('• $line', style: Theme.of(context).textTheme.bodySmall),
                 ),
               const SizedBox(height: 8),
-              Text('Version 3.1.0', style: Theme.of(context).textTheme.bodySmall),
+              Text('Version 4.0.0', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ),

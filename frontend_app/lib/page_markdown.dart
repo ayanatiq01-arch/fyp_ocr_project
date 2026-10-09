@@ -82,6 +82,39 @@ String pageMarkdown(OcrResult result, {bool Function(double confidence)? isLow})
   return out.isEmpty ? '' : '${out.join('\n\n')}\n';
 }
 
+/// What is shown, printed and exported for a page: the vision model's
+/// corrected Markdown, or the rough draft as Markdown ([isLow] marks the
+/// uncertain words of a rough draft).
+String displayMarkdown(OcrResult result, {bool Function(double confidence)? isLow}) =>
+    result.isCorrected ? result.markdown : pageMarkdown(result, isLow: isLow);
+
+final _mdTableRule = RegExp(r'^\|?\s*:?-{3,}');
+final _mdEscape = RegExp(r'\\([\\`*_\[\]<>|~=#+\-.!()])');
+
+/// Plain text of page Markdown (for Copy and the master text): headings
+/// without '#', bullets as '• ', table cells separated by TAB, inline
+/// markers and escapes removed.
+String markdownToPlain(String md) {
+  final out = <String>[];
+  for (var line in md.split('\n')) {
+    line = line.trimRight();
+    final t = line.trim();
+    if (_mdTableRule.hasMatch(t) || RegExp(r'^(\*{3,}|-{3,}|_{3,})$').hasMatch(t)) continue;
+    if (t.startsWith('#')) {
+      line = t.replaceFirst(RegExp(r'^#+\s*'), '');
+    } else if (t.startsWith('- ') || t.startsWith('* ') || t.startsWith('+ ')) {
+      line = '• ${t.substring(2)}';
+    } else if (t.startsWith('|')) {
+      line = t.replaceAll(RegExp(r'^\||\|$'), '').split('|').map((c) => c.trim()).join('\t');
+    }
+    line = line
+        .replaceAll(RegExp(r'(\*\*|__|==)'), '')
+        .replaceAllMapped(_mdEscape, (m) => m[1]!);
+    out.add(line);
+  }
+  return out.join('\n').replaceAll(RegExp(r'\n{3,}'), '\n\n').trim();
+}
+
 /// Most common script on the page ("urdu" / "arabic"), for the reading font.
 String pageLanguage(OcrResult result) {
   var urdu = 0, arabic = 0;

@@ -59,15 +59,18 @@ void main() {
     api.dispose();
   });
 
-  test('Page source: Gemini vs local OCR', () {
-    OcrResult page(String ai) => OcrResult.fromJson({
+  test('Corrected Markdown is used only when the vision model corrected the draft', () {
+    OcrResult page(String ai, String md) => OcrResult.fromJson({
           'image': {'width': 10, 'height': 10},
           'blocks': [],
           'ai_correction': ai,
+          'markdown': md,
         });
-    expect(page('gemini-3.6-flash').readByGemini, isTrue);
-    expect(page('off').readByGemini, isFalse);
-    expect(page('failed: no Gemini model available').readByGemini, isFalse);
-    expect(OcrResult.fromJson({'image': {'width': 1, 'height': 1}}).aiCorrection, 'off');
+    expect(page('gemini-3.6-flash', '## عنوان').isCorrected, isTrue);
+    expect(page('gemini-3.6-flash', '').isCorrected, isFalse);
+    expect(page('off', '## عنوان').isCorrected, isFalse);
+    expect(page('failed: no Gemini model available', '## x').isCorrected, isFalse);
+    final back = OcrResult.fromJson(page('gemini-3.6-flash', '## عنوان').toJson());
+    expect(back.markdown, '## عنوان'); // saved with the book
   });
 }

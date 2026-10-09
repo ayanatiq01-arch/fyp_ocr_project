@@ -135,14 +135,17 @@ class OcrResponse(BaseModel):
         default_factory=list,
         description="Every line of the page top-to-bottom (Y), each line's words "
                     "right-to-left (X): the exact reading order of the original layout")
-    formatted_text: str = Field(..., description="Page text: blank line between blocks, "
+    formatted_text: str = Field(..., description="ROUGH DRAFT of the local OCR (UTRNet / "
+                                                 "EasyOCR): blank line between blocks, "
                                                  "TAB between table columns, '• ' bullets")
-    markdown: str = Field("", description="The page as Markdown: ## headings, - bullets, one "
+    markdown: str = Field("", description="FINAL page as Markdown: corrected by the vision "
+                                          "model if ai_correction names a model, else the "
+                                          "rough draft as Markdown: ## headings, - bullets, one "
                                           "line per printed line (hard breaks), tables")
     processing_ms: int
-    ai_correction: str = Field("off", description="Gemini model that read the page, 'off' "
-                                                  "(local OCR), or 'failed: <reason>' (local OCR "
-                                                  "used because Gemini was unavailable)")
+    ai_correction: str = Field("off", description="Gemini model that corrected the draft, 'off' "
+                                                  "(not corrected), or 'failed: <reason>' (rough "
+                                                  "draft returned because Gemini was unavailable)")
 
 
 def _pct(x: float) -> float:
@@ -274,10 +277,11 @@ def _read_upload(file: UploadFile) -> tuple[str, Path, np.ndarray]:
     return request_id, temp_path, image
 
 
-LANGUAGE_HELP = ("mixed = both engines + confidence router (default); "
-                 "urdu = UTRNet only; arabic = PaddleOCR only")
-AI_HELP = ("true = Gemini reads the page (text, boxes and layout); falls back to the "
-           "local OCR engines if Gemini is unavailable (needs GEMINI_API_KEY)")
+LANGUAGE_HELP = ("mixed = UTRNet reads every box, Arabic boxes are re-read by EasyOCR "
+                 "(default); urdu = UTRNet only; arabic = EasyOCR only")
+AI_HELP = ("true = the original image + rough draft go to Gemini, which returns the "
+           "corrected page as Markdown; without Gemini the rough draft is returned "
+           "(needs GEMINI_API_KEY)")
 
 
 def _check_language(language: str) -> None:

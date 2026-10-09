@@ -91,4 +91,40 @@ void main() {
     );
     expect(String.fromCharCodes(pdf.take(5)), '%PDF-');
   });
+
+  test('Corrected Markdown: plain text and Word blocks', () {
+    final md = [
+      '## آلِ عِمْرٰن',
+      '',
+      'لَا رَیْبَ فِیْہِ ۝۹  ',
+      'دوسری سطر',
+      '',
+      '- پہلا نکتہ',
+      '- دوسرا',
+      '',
+      '| سَمِعَ | اس نے سنا |',
+      '| --- | --- |',
+      '| عَلِمَ | اس نے جانا |',
+    ].join('\n');
+    expect(
+        markdownToPlain(md),
+        [
+          'آلِ عِمْرٰن',
+          '',
+          'لَا رَیْبَ فِیْہِ ۝۹',
+          'دوسری سطر',
+          '',
+          '• پہلا نکتہ',
+          '• دوسرا',
+          '',
+          'سَمِعَ\tاس نے سنا',
+          'عَلِمَ\tاس نے جانا',
+        ].join('\n'));
+    final blocks = ExportBlock.ofMarkdown(md);
+    expect(blocks.map((b) => b.type), ['Title', 'Text', 'List', 'Table']);
+    expect(blocks[1].rows.length, 2); // the book's two lines stay two lines
+    expect(blocks[2].rows.every((r) => r.bullet), isTrue);
+    expect(blocks[3].rows.length, 2); // header rule dropped
+    expect(blocks[3].rows.first.cells, ['سَمِعَ', 'اس نے سنا']);
+  });
 }

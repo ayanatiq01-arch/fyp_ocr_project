@@ -2,8 +2,8 @@
 ocr_pipeline.py
 ===============
 
-Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline with a
-**Confidence Score Routing Algorithm**.
+Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline:
+local OCR rough draft + vision-LLM correction to Markdown.
 
     uploaded photo (whole page - no manual cropping needed)
         │
@@ -11,36 +11,41 @@ Bilingual (Urdu Nastaliq + Arabic Naskh) OCR pipeline with a
     orientation + image_processing.preprocess()   0/90/180/270 · deskew · shadows · denoise
         │
         ▼
-    TextDetector (PaddleOCR DB)          AUTO-CROP: one box per text line / table cell
+    TextDetector (PaddleOCR DB, detection only)   one box per text line / table cell
         │
         ▼
     build_layout()                       boxes -> rows -> blocks (paragraph / list /
         │                                table / title) + LayoutParser block hints
         ▼
-    for every box, in reading order:
-        ├──► UTRNetRecognizer        (Urdu)    ─┐  run at the same time
-        └──► PaddleArabicRecognizer  (Arabic)  ─┘
+    every box is ROUTED by script:
+        ├──► UTRNetRecognizer         Urdu (Nastaliq)
+        └──► EasyOcrArabicRecognizer  Arabic (Naskh)  - EasyOCR, local and open source
                         │
                         ▼
-                route_by_confidence()     higher confidence wins, other discarded
+    ROUGH DRAFT: boxes sorted top-to-bottom (Y) and right-to-left (X) into
+    lines and paragraphs (the streamed text the app shows while reading)
                         │
                         ▼
-    results are streamed as they are ready; finally the page is re-assembled
-    with its paragraphs, bullets and table columns.
+    GeminiMarkdownCorrector: the ORIGINAL full image + the rough draft in one
+    request; the vision model fixes spelling / ligature errors and returns
+    the page as Markdown matching the visual layout.
 
-Why confidences are comparable
-------------------------------
-Both recognisers are CTC models. PaddleOCR's ``rec_score`` is the mean of the
-max softmax probability over the frames that survive CTC decoding (non-blank,
-not a repeat). :class:`UTRNetRecognizer` computes its score **the same way**,
-so the two numbers are on the same 0-1 scale and can be compared directly.
+Routing (``language`` chosen in the app):
+* "urdu"   - every box goes to UTRNet;
+* "arabic" - every box goes to EasyOCR;
+* "mixed"  - UTRNet reads every box first; boxes whose reading is Arabic
+             (Arabic-only letters such as ك ي ة أ, or vocalised text with
+             harakat, e.g. Quran verses) are then read by EasyOCR.
+EasyOCR is not run on every box because it takes ~5 s per line on a
+dual-core CPU (UTRNet ~1 s).
 
 Models (all published, downloaded as-is):
 * UTRNet-Large  - ``UTRNet-High-Resolution-Urdu-Text-Recognition/saved_models/
   UTRNet-Large/best_norm_ED.pth`` (from the UTRNet README, Google Drive link).
-* PaddleOCR     - ``arabic_PP-OCRv5_mobile_rec`` (recognition) and
-  ``PP-OCRv5_mobile_det`` (text detection), auto-downloaded to
-  ``~/.paddlex/official_models`` on first run.
+* EasyOCR       - Arabic recognition model (github.com/JaidedAI/EasyOCR),
+  auto-downloaded to ``~/.EasyOCR/model`` on first run.
+* PaddleOCR     - ``PP-OCRv5_mobile_det`` (text detection only),
+  auto-downloaded to ``~/.paddlex/official_models`` on first run.
 * LayoutParser  - ``lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config``.
 """
 
@@ -77,23 +82,22 @@ UTRNET_WEIGHTS = Path(os.getenv(
     "UTRNET_WEIGHTS", UTRNET_DIR / "saved_models" / "UTRNet-Large" / "best_norm_ED.pth"))
 UTRNET_GLYPHS = UTRNET_DIR / "UrduGlyphs.txt"
 
-PADDLE_ARABIC_MODEL = os.getenv("PADDLE_ARABIC_MODEL", "arabic_PP-OCRv5_mobile_rec")
 PADDLE_DET_MODEL = os.getenv("PADDLE_DET_MODEL", "PP-OCRv5_mobile_det")
 LAYOUT_MODEL_CONFIG = os.getenv(
     "LAYOUT_MODEL_CONFIG", "lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config")
 LAYOUT_SCORE_THRESHOLD = float(os.getenv("LAYOUT_SCORE_THRESHOLD", "0.5"))
 # "cpu" (default) or "gpu" (needs CUDA builds of PyTorch and PaddlePaddle).
 OCR_DEVICE = os.getenv("OCR_DEVICE", "cpu").lower()
-# UTRNet (HRNet at full resolution) dominates run time, so PyTorch gets all
-# cores; the much lighter Paddle models get half.
+# PyTorch (UTRNet, EasyOCR) gets all cores; the Paddle detector gets half.
 TORCH_THREADS = int(os.getenv("TORCH_THREADS", str(os.cpu_count() or 4)))
 CPU_THREADS = int(os.getenv("OCR_CPU_THREADS", str(max(1, (os.cpu_count() or 4) // 2))))
-# Router calibration (see route_by_confidence). 0.0 = pure score comparison.
-ROUTER_URDU_MARGIN = float(os.getenv("ROUTER_URDU_MARGIN", "0.0"))
-# Results below this confidence (from BOTH engines) are treated as non-text
-# (page ornaments, stains, torn edges) and dropped from the final page.
+# UTRNet results below this confidence are treated as non-text (page
+# ornaments, stains, torn edges) and dropped from the rough draft.
 MIN_TEXT_CONFIDENCE = float(os.getenv("MIN_TEXT_CONFIDENCE", "0.5"))
-# AI page reading (GeminiPageReader). Needs GEMINI_API_KEY
+# EasyOCR's scores are on a much lower scale (correct Quran lines scored
+# 0.01-0.3), so its noise threshold is separate.
+EASYOCR_MIN_CONFIDENCE = float(os.getenv("EASYOCR_MIN_CONFIDENCE", "0.005"))
+# Vision-LLM correction (GeminiMarkdownCorrector). Needs GEMINI_API_KEY
 # (backend_api/.env); GEMINI_CORRECTION=0 switches it off.
 GEMINI_CORRECTION = os.getenv("GEMINI_CORRECTION", "1") != "0"
 # Flash models tried in order. The free tier allows only ~20 requests per
@@ -102,22 +106,20 @@ GEMINI_CORRECTION = os.getenv("GEMINI_CORRECTION", "1") != "0"
 GEMINI_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,"
                      "gemini-3.5-flash,gemini-3-flash-preview,"
-                     # Last resort (own daily quota, ~5 s, but they may join
-                     # lines and drop ayah numbers): better than local OCR.
+                     # Last resort (own daily quota, ~5 s, follow the layout
+                     # less strictly): better than the uncorrected draft.
                      "gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
                      ).split(",") if m.strip()]
 # Long side of the photo sent to Gemini (pixels).
 GEMINI_MAX_SIDE = int(os.getenv("GEMINI_MAX_SIDE", "2000"))
 # Smaller photos are enlarged to this long side before they are sent.
 GEMINI_MIN_SIDE = int(os.getenv("GEMINI_MIN_SIDE", "1600"))
-# Gemini gives no per-word score; its text is reported with this confidence.
-GEMINI_CONFIDENCE = 0.99
 GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "60"))  # seconds for the whole page
 # A model that has not answered after this many seconds gets the next model
 # as a parallel backup (first good answer wins).
 GEMINI_HEDGE_AFTER = float(os.getenv("GEMINI_HEDGE_AFTER", "5"))
 # Passes over all models when they are only overloaded (503), before the
-# page is read by the (much slower) local OCR instead.
+# uncorrected rough draft is returned instead.
 GEMINI_ROUNDS = int(os.getenv("GEMINI_ROUNDS", "3"))
 # Gemini 3 models think before answering; "low" keeps a page at ~15-60 s.
 GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low")
@@ -133,7 +135,7 @@ _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
 @dataclass
 class EngineResult:
     """Output of one recogniser for one box."""
-    engine: str          # "UTRNet" | "PaddleOCR"
+    engine: str          # "UTRNet" | "EasyOCR"
     language: str        # LANG_URDU | LANG_ARABIC
     text: str
     confidence: float    # 0.0 - 1.0
@@ -296,173 +298,115 @@ class UTRNetRecognizer:
 
 
 # --------------------------------------------------------------------------- #
-# Recogniser 2: PaddleOCR (Arabic, Naskh)
+# Recogniser 2: EasyOCR (Arabic, Naskh)
 # --------------------------------------------------------------------------- #
-class PaddleArabicRecognizer:
-    """PaddleOCR 3.x Arabic-script text-recognition model."""
+class EasyOcrArabicRecognizer:
+    """EasyOCR's Arabic recognition model (github.com/JaidedAI/EasyOCR):
+    local and open source. Only the recogniser is used (``detector=False``);
+    the boxes come from :class:`TextDetector`."""
 
-    name = "PaddleOCR"
+    name = "EasyOCR"
     language = LANG_ARABIC
 
-    def __init__(self, model_name: str = PADDLE_ARABIC_MODEL, device: str = "cpu"):
-        # Skip PaddleX's network probe of model mirrors on every start-up.
-        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-        from paddleocr import TextRecognition
-        self.model_name = model_name
-        self.model = TextRecognition(model_name=model_name, device=device,
-                                     cpu_threads=CPU_THREADS)
+    def __init__(self, device: str = "cpu"):
+        import easyocr
+        self.reader = easyocr.Reader(["ar"], gpu=device != "cpu", detector=False, verbose=False)
         self._lock = threading.Lock()
-        logger.info("PaddleOCR recogniser loaded: %s", model_name)
+        logger.info("EasyOCR Arabic recogniser loaded")
 
     def recognize_batch(self, images: Sequence[np.ndarray]) -> List[EngineResult]:
-        if not images:
-            return []
-        bgr = [cv2.cvtColor(g, cv2.COLOR_GRAY2BGR) for g in images]
-        with self._lock:
-            outputs = self.model.predict(input=bgr, batch_size=min(8, len(bgr)))
         results = []
-        for out in outputs:
-            text = str(out["rec_text"]).strip()
-            conf = float(out["rec_score"]) if text else 0.0
+        for gray in images:
+            h, w = gray.shape[:2]
+            with self._lock:
+                parts = self.reader.recognize(gray, horizontal_list=[[0, w, 0, h]], free_list=[],
+                                              detail=1, paragraph=False)
+            text = " ".join(str(p[1]).strip() for p in parts if str(p[1]).strip())
+            conf = float(np.mean([p[2] for p in parts])) if parts and text else 0.0
             results.append(EngineResult(self.name, self.language, text, conf))
         return results
 
 
 # --------------------------------------------------------------------------- #
-# AI page reading: Gemini reads the whole page (text + boxes + layout)
+# Script routing
 # --------------------------------------------------------------------------- #
-_URDU_ONLY_RE = re.compile(r"[ٹڈڑںےۓھگچپژکیہۂۃ]")
+_ARABIC_ONLY_RE = re.compile(r"[\u0643\u064A\u0629\u0649\u0623\u0625]")   # ك ي ة ى أ إ
+_HARAKAT_RE = re.compile(r"[\u064B-\u0652]")
+_LETTER_RE = re.compile(r"[\u0621-\u064A\u0671-\u06D3]")
 
 
-def script_language(text: str) -> str:
-    """"urdu" if the text uses Urdu-only letters, "arabic" for other
-    Arabic-script text, else "unknown" (used to pick the reading font)."""
-    if _URDU_ONLY_RE.search(text):
-        return LANG_URDU
-    return LANG_ARABIC if _ARABIC_SCRIPT_RE.search(text) else "unknown"
+def looks_arabic(text: str) -> bool:
+    """True if a (UTRNet) reading is Arabic rather than Urdu: Arabic-only
+    letters (Urdu writes ک ی ہ instead of ك ي ة), or vocalised text - one
+    haraka per 4 letters or more, as in Quran verses."""
+    letters = len(_LETTER_RE.findall(text))
+    if letters < 3:
+        return False
+    arabic_only = len(_ARABIC_ONLY_RE.findall(text))
+    return arabic_only / letters >= 0.08 or len(_HARAKAT_RE.findall(text)) / letters >= 0.25
 
 
-def blocks_from_gemini(page: dict, width: int, height: int, language: str = "mixed",
-                       engine: str = "Gemini") -> List[Block]:
-    """Turns Gemini's JSON page ({"blocks": [{type, rows: [{is_bullet,
-    cells: [{column, box_2d, text}]}]}]}) into the pipeline's Block / Row /
-    Cell structure. ``box_2d`` is [ymin, xmin, ymax, xmax] on a 0-1000 scale;
-    boxes are converted to pixels of the image (``width`` x ``height``)."""
-    def to_box(b) -> Optional[ip.Box]:
-        try:
-            y1, x1, y2, x2 = (min(1000, max(0, int(v))) for v in b[:4])
-        except (TypeError, ValueError):
-            return None
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
-        if x2 <= x1 or y2 <= y1:
-            return None
-        return (x1 * width // 1000, y1 * height // 1000,
-                -(-x2 * width // 1000), -(-y2 * height // 1000))
-
-    blocks: List[Block] = []
-    for b in page.get("blocks", []):
-        kind = b.get("type") if b.get("type") in ("Title", "Text", "List", "Table") else "Text"
-        rows: List[Row] = []
-        for r in b.get("rows", []):
-            cells = []
-            for c in r.get("cells", []):
-                text = " ".join(str(c.get("text", "")).split())
-                box = to_box(c.get("box_2d"))
-                if not text or box is None:
-                    continue
-                lang = language if language in (LANG_URDU, LANG_ARABIC) else script_language(text)
-                result = EngineResult(engine, lang, text, GEMINI_CONFIDENCE)
-                cells.append(Cell(box=box, column=int(c.get("column") or 0), text=text,
-                                  language=lang, engine=engine, confidence=GEMINI_CONFIDENCE,
-                                  candidates={lang: result}, done=True))
-            if not cells:
-                continue
-            if kind == "Table":
-                cells.sort(key=lambda c: c.column)
-            rows.append(Row(box=ip.union_box([c.box for c in cells]), cells=cells,
-                            is_bullet=bool(r.get("is_bullet"))))
-        if not rows:
-            continue
-        block = Block(box=ip.union_box([r.box for r in rows]), type=kind, rows=rows)
-        if kind == "Table":
-            used = sorted({c.column for r in rows for c in r.cells})
-            remap = {old: new for new, old in enumerate(used)}
-            for r in rows:
-                for c in r.cells:
-                    c.column = remap[c.column]
-            block.columns = len(used)
-        else:
-            for r in rows:                      # one cell per line outside tables
-                for c in r.cells:
-                    c.column = 0
-        blocks.append(block)
-    return blocks
+# --------------------------------------------------------------------------- #
+# Vision-LLM correction: original image + rough draft -> Markdown
+# --------------------------------------------------------------------------- #
+_HTML_TAG_RE = re.compile(r"</?(?:u|b|i|em|strong|span|sup|sub|small|big|font|mark|br)(?![a-z])[^>]*>",
+                          re.I)
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```\s*$", re.S)
 
 
-class GeminiPageReader:
-    """Reads a whole page photo with Google Gemini (Flash, vision).
+def hard_line_breaks(md: str) -> str:
+    """Markdown joins consecutive lines into one paragraph; the book's line
+    breaks are kept by ending every text line that is followed by another
+    text line with two spaces (a hard break). Headings, list items, tables
+    and blank lines are left as they are."""
+    lines = md.split("\n")
 
-    One request per page: Gemini returns every printed line (and every table
-    cell) with its text exactly as printed and its bounding box, grouped into
-    Title / Text / List / Table blocks in reading order - so text, boxes and
-    format come from the same model. The free tier allows ~20 requests per
-    day per model, so the next model in ``GEMINI_MODELS`` takes over when
-    one is exhausted or overloaded. Failures raise; the pipeline then falls
-    back to the local OCR engines.
+    def plain(line: str) -> bool:
+        t = line.strip()
+        return bool(t) and not t.startswith(("#", "-", "*", "+", "|", ">")) and not re.match(r"\d+[.)]\s", t)
+
+    out = []
+    for i, line in enumerate(lines):
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if plain(line) and plain(nxt) and not line.endswith("  "):
+            line = line.rstrip() + "  "
+        out.append(line)
+    return "\n".join(out)
+
+
+class GeminiMarkdownCorrector:
+    """The final correction layer: the ORIGINAL full page image and the
+    rough draft from the local OCR go to a Gemini Flash vision model in a
+    single request; it fixes spelling / ligature errors and returns the page
+    as Markdown matching the visual layout.
+
+    The free tier allows ~20 requests per day per model, so the next model
+    in ``GEMINI_MODELS`` takes over when one is exhausted or overloaded.
+    Failures raise; the pipeline then returns the uncorrected draft.
     """
 
     URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    PROMPT = (
-        "This is a photo of a page from an Urdu and/or Arabic book. Transcribe ALL the text on "
-        "the page exactly as printed and reproduce its layout.\n"
-        "Return the page as blocks in reading order (top to bottom; when regions sit side by "
-        "side, the right-hand one first). Block type is one of: Title (a heading), Text "
-        "(paragraph), List (bulleted or numbered items), Table.\n"
-        "Each block has rows; a row is ONE printed line. For every row give its cells:\n"
-        "- In Text / Title / List blocks each row has exactly one cell covering the whole line.\n"
-        "- In Table blocks each row is one table row and has one cell per column; column 0 is "
-        "the RIGHT-most column.\n"
-        "For every cell give box_2d = [ymin, xmin, ymax, xmax] on a 0-1000 scale of this image, "
-        "tight around that cell's text, and the text exactly as printed: keep the original "
-        "spelling, harakat only where printed, digits, brackets and punctuation. Do not "
-        "translate, correct or add anything. If a line starts with a bullet symbol set "
-        "is_bullet true and leave the symbol out of the text. Include headers, page numbers "
-        "and every line - skip nothing.\n"
-        "CHECKLIST - these marks are part of the text and must NEVER be dropped:\n"
-        "1. End of ayah: after every Quranic verse the book prints a small circle or "
-        "rosette, usually with the verse number inside. Write it right after the verse as "
-        "\u06dd followed by that number in the same digits as printed, e.g. "
-        "\u06dd\u0669  \u06dd\u0661\u0660  \u06dd\u06f1\u06f2. If the verse number is printed "
-        "in brackets instead, copy the brackets: \ufd3f\u0662\ufd3e (\u0663).\n"
-        "2. Ruku sign: the letter \u0639 (sometimes with numbers) printed at the end of a "
-        "section, in the line or in the margin - copy it where it appears.\n"
-        "3. Waqf / pause marks printed above the Quran text (\u0637 \u062c \u0645 \u0644\u0627 "
-        "\u0632 \u0635\u0644\u06d2 \u06da \u06d6 \u06d7 \u06db) - copy each one right after the word "
-        "it stands on.\n"
-        "4. Inverted commas and quotation marks around quoted speech (\u201c \u201d \u2018 "
-        "\u2019 \u00ab \u00bb \" '), even when only the closing one is visible on this page.\n"
-        "5. Brackets ( ) [ ] \ufd3e \ufd3f, footnote numbers and markers, the page number and "
-        "all punctuation (\u060c \u061b \u061f \u06d4 . : ! - \u2013).\n"
-        "Keep harakat exactly as printed; do not add or remove any.\n"
-        "Strictly preserve the exact visual formatting of the page: one row per physical "
-        "printed line (the line breaks must match the book exactly - never join or split "
-        "lines), a prominent heading is its own Title block, bulleted items are List rows "
-        "with is_bullet true, and paragraphs that are visually separated are separate "
-        "blocks. The server turns this structure into a Markdown document (## headings, "
-        "- bullets, line breaks, tables).")
-    SCHEMA = {"type": "OBJECT", "properties": {"blocks": {"type": "ARRAY", "items": {
-        "type": "OBJECT", "properties": {
-            "type": {"type": "STRING", "enum": ["Title", "Text", "List", "Table"]},
-            "rows": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-                "is_bullet": {"type": "BOOLEAN"},
-                "cells": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-                    "column": {"type": "INTEGER"},
-                    "box_2d": {"type": "ARRAY", "items": {"type": "INTEGER"}},
-                    "text": {"type": "STRING"}},
-                    "required": ["box_2d", "text"]}}},
-                "required": ["cells"]}}},
-        "required": ["type", "rows"]}}}, "required": ["blocks"]}
+    # The system prompt exactly as specified for the project.
+    SYSTEM_PROMPT = (
+        "You are an expert document reconstruction AI. I am providing you with the original "
+        "image of a book page and the rough text extracted by local OCR models. Visually "
+        "inspect the original image, compare it with the rough text, and fix ALL spelling and "
+        "ligature errors. Finally, format the output in perfect 'Markdown' format to exactly "
+        "match the visual layout of the original image (use markdown lists for bullet points, "
+        "markdown headers for titles, and exact line breaks). Return ONLY the corrected, "
+        "perfectly formatted Markdown string.")
+    # Added to the request (not the system prompt): marks that must be kept.
+    MARKS = (
+        "Line breaks: the rough text has ONE line per printed line of the page. Keep exactly "
+        "these line breaks - every printed line is its own line in your Markdown; never join "
+        "lines into a paragraph and never split a line. Separate paragraphs / sections with "
+        "a blank line, as on the page.\n"
+        "Keep every mark that is printed on the page, exactly where it stands: the end-of-ayah "
+        "sign after every Quranic verse written as \u06dd followed by the verse number in the "
+        "same digits as printed (e.g. \u06dd\u0669, \u06dd\u06f1\u06f2), the ruku sign \u0639, waqf "
+        "marks (\u0637 \u062c \u0645 \u0644\u0627 \u06da \u06d6 \u06d7), inverted commas and quotation "
+        "marks (\u201c \u201d \u2018 \u2019 \u00ab \u00bb), brackets ( ) \ufd3e \ufd3f, footnote markers, "
+        "the page number, harakat as printed and all punctuation (\u060c \u061b \u061f \u06d4).")
 
     def __init__(self, api_key: str, models: Sequence[str] = tuple(GEMINI_MODELS)):
         import requests
@@ -471,24 +415,25 @@ class GeminiPageReader:
         self.last_model = ""                       # model that answered last
         self._resting: Dict[str, float] = {}      # model -> time its quota is back
         self._http = requests.Session()
-        logger.info("Gemini page reading enabled: %s", ", ".join(self.models))
+        logger.info("Gemini correction enabled: %s", ", ".join(self.models))
 
     @classmethod
-    def from_env(cls) -> Optional["GeminiPageReader"]:
+    def from_env(cls) -> Optional["GeminiMarkdownCorrector"]:
         key = os.getenv("GEMINI_API_KEY", "").strip()
         if not key or not GEMINI_CORRECTION:
-            logger.info("Gemini page reading disabled (no GEMINI_API_KEY or GEMINI_CORRECTION=0)")
+            logger.info("Gemini correction disabled (no GEMINI_API_KEY or GEMINI_CORRECTION=0)")
             return None
         return cls(key)
 
-    def read_page(self, image_bgr: np.ndarray) -> dict:
-        """Gemini's JSON page for the photo (boxes on a 0-1000 scale)."""
+    @staticmethod
+    def _image_part(image_bgr: np.ndarray) -> dict:
+        """The photo as JPEG: big photos reduced to GEMINI_MAX_SIDE, small
+        ones (e.g. sent via WhatsApp) enlarged to GEMINI_MIN_SIDE so tiny
+        marks - ayah numbers in their circles, waqf signs, quotes - stay
+        legible."""
         import base64
         h, w = image_bgr.shape[:2]
         long_side = float(max(h, w))
-        # Big photos are reduced to GEMINI_MAX_SIDE; small ones (e.g. sent via
-        # WhatsApp) are enlarged to GEMINI_MIN_SIDE so tiny marks - ayah
-        # numbers in their circles, waqf signs, quotes - stay legible.
         s = min(1.0, GEMINI_MAX_SIDE / long_side)
         if long_side < GEMINI_MIN_SIDE:
             s = GEMINI_MIN_SIDE / long_side
@@ -496,34 +441,47 @@ class GeminiPageReader:
             image_bgr, (max(1, int(w * s)), max(1, int(h * s))),
             interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
         ok, buf = cv2.imencode(".jpg", send, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return {"inline_data": {"mime_type": "image/jpeg",
+                                "data": base64.b64encode(buf.tobytes()).decode("ascii")}}
+
+    def correct(self, image_bgr: np.ndarray, rough_text: str) -> str:
+        """Corrected page as Markdown (with the book's line breaks)."""
         body = {
+            "systemInstruction": {"parts": [{"text": self.SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [
-                {"inline_data": {"mime_type": "image/jpeg",
-                                 "data": base64.b64encode(buf.tobytes()).decode("ascii")}},
-                {"text": self.PROMPT}]}],
+                self._image_part(image_bgr),
+                {"text": "Rough text extracted by the local OCR models (top to bottom, each "
+                         "line right to left):\n\n" + (rough_text.strip() or "(nothing found)")
+                         + "\n\n" + self.MARKS},
+            ]}],
             "generationConfig": {
                 "temperature": 0,
-                "responseMimeType": "application/json",
-                "responseSchema": self.SCHEMA,
                 "mediaResolution": "MEDIA_RESOLUTION_HIGH",
                 "thinkingConfig": {"thinkingLevel": GEMINI_THINKING},
             },
         }
-        return self._post(body, self._parse_page)
+        return hard_line_breaks(self._post(body, self._parse_markdown))
 
     @staticmethod
-    def _parse_page(data: dict) -> dict:
-        """The page JSON of a reply; raises if the answer is cut off or not
-        valid JSON (that model's answer is then not used)."""
+    def _parse_markdown(data: dict) -> str:
+        """The Markdown of a reply; raises if it is cut off, empty or not
+        Urdu/Arabic text (that model's answer is then not used)."""
         cand = data["candidates"][0]
         reason = cand.get("finishReason", "STOP")
         if reason != "STOP":
             raise RuntimeError(f"answer incomplete ({reason})")
-        answer = "".join(p.get("text", "") for p in cand["content"].get("parts", []))
-        page = json.loads(answer)
-        if not isinstance(page, dict) or not isinstance(page.get("blocks"), list):
-            raise RuntimeError("answer has no blocks")
-        return page
+        md = "".join(p.get("text", "") for p in cand["content"].get("parts", [])
+                     if not p.get("thought")).strip()
+        fenced = _FENCE_RE.match(md)
+        if fenced:
+            md = fenced.group(1).strip()
+        # HTML tags (e.g. <u> for underlined words) are not Markdown and would
+        # show as raw text; invisible direction marks are dropped too.
+        md = _HTML_TAG_RE.sub("", md)
+        md = re.sub(r"^[‎‏؜]+", "", md, flags=re.M)
+        if not _ARABIC_SCRIPT_RE.search(md):
+            raise RuntimeError("answer has no Urdu/Arabic text")
+        return md
 
     def _post(self, body: dict, parse):
         """Sends the request and returns ``parse(reply)`` of the first good answer.
@@ -860,36 +818,6 @@ class TextDetector:
         if extra:
             logger.info("detector fallback added %d boxes", len(extra))
         return boxes + extra
-
-
-# --------------------------------------------------------------------------- #
-# THE ROUTER - Confidence Score Routing Algorithm
-# --------------------------------------------------------------------------- #
-def route_by_confidence(urdu: EngineResult, arabic: EngineResult,
-                        urdu_margin: float = ROUTER_URDU_MARGIN
-                        ) -> Tuple[EngineResult, EngineResult]:
-    """Pick the language of a box by comparing the two engines' confidences.
-
-    No language classifier is trained. Each engine only knows its own script
-    well, so the engine that is *more confident* about the box is taken to
-    be reading the correct language. The other result is discarded.
-
-    ``urdu_margin`` (default 0.0 = plain comparison) is an optional
-    calibration offset subtracted from UTRNet's score before comparing.
-    Tune it on a labelled validation set; do not guess it.
-
-    Ties go to Urdu (UTRNet), the primary language of the target books.
-
-    Returns:
-        (accepted, rejected)
-    """
-    if urdu.confidence - urdu_margin >= arabic.confidence:
-        accepted, rejected = urdu, arabic      # Urdu (Nastaliq) wins
-    else:
-        accepted, rejected = arabic, urdu      # Arabic (Naskh) wins
-    logger.debug("route: urdu=%.3f arabic=%.3f margin=%.2f -> %s",
-                 urdu.confidence, arabic.confidence, urdu_margin, accepted.language)
-    return accepted, rejected
 
 
 # --------------------------------------------------------------------------- #
@@ -1296,12 +1224,15 @@ def clean_bullet_text(text: str, glyph_bullet: bool) -> Tuple[str, bool]:
 
 
 def _is_noise(cell: Cell) -> bool:
-    """Page ornaments / stains read as text: both engines unsure, or output
-    with no Arabic-script letters at modest confidence."""
+    """Page ornaments / stains read as text: the recogniser is unsure, or
+    the output has no Arabic-script letters at modest confidence. EasyOCR
+    scores are on a far lower scale than UTRNet's, so each engine has its
+    own threshold."""
     if not cell.text:
         return True
-    best = max((c.confidence for c in cell.candidates.values()), default=0.0)
-    if best < MIN_TEXT_CONFIDENCE:
+    if cell.engine == EasyOcrArabicRecognizer.name:
+        return cell.confidence < EASYOCR_MIN_CONFIDENCE or not _ARABIC_SCRIPT_RE.search(cell.text)
+    if cell.confidence < MIN_TEXT_CONFIDENCE:
         return True
     if len(cell.text.strip()) == 1 and cell.confidence < 0.9:
         return True                     # a lone uncertain glyph: ornament / stain
@@ -1386,38 +1317,38 @@ class PipelineResult:
     layout_engine: str
     processing_ms: int
     rotation: int = 0            # degrees CCW applied to make the page upright
-    ai_correction: str = "off"   # "gemini-...": page read by Gemini; "off"; "failed: ..."
+    ai_correction: str = "off"   # Gemini model that corrected the draft; "off"; "failed: ..."
+    corrected_markdown: str = "" # the vision model's Markdown ("" = not corrected)
 
     def formatted_text(self) -> str:
-        """Plain text that preserves the page structure: blank line between
-        blocks, one line per printed line, TAB between table columns, bullets
-        as '• '."""
+        """The ROUGH DRAFT of the local OCR: boxes sorted top-to-bottom and
+        right-to-left into lines; blank line between blocks, TAB between
+        table columns, bullets as '• '."""
         return "\n\n".join(t for t in (b.text() for b in self.blocks) if t)
 
     def markdown(self) -> str:
-        """The page as a Markdown document (see :func:`blocks_to_markdown`)."""
-        return blocks_to_markdown(self.blocks)
+        """The final page: the corrected Markdown, or - if the correction did
+        not run - the rough draft as Markdown (:func:`blocks_to_markdown`)."""
+        return self.corrected_markdown or blocks_to_markdown(self.blocks)
 
 
 class OcrPipeline:
     """Loads all models once and processes whole-page photos end-to-end."""
 
-    # Boxes sent to both engines together; also the streaming granularity.
+    # Boxes recognised together; also the streaming granularity.
     CHUNK = 4
     # Detected boxes read upright and flipped for the 0/180 decision.
-    ORIENTATION_SAMPLE_LINES = 8
+    ORIENTATION_SAMPLE_LINES = 4
 
     def __init__(self, device: str = OCR_DEVICE):
         """``device``: "cpu" or "gpu" (PyTorch 'cuda' / Paddle 'gpu:0')."""
         t0 = time.perf_counter()
         use_gpu = device == "gpu"
         self.urdu = UTRNetRecognizer(device="cuda" if use_gpu else "cpu")
-        self.arabic = PaddleArabicRecognizer(device="gpu:0" if use_gpu else "cpu")
+        self.arabic = EasyOcrArabicRecognizer(device="cuda" if use_gpu else "cpu")
         self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
-        self.gemini = GeminiPageReader.from_env()
-        # Two workers: one per engine, so both read the same boxes concurrently.
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
+        self.gemini = GeminiMarkdownCorrector.from_env()
         # LayoutParser runs in the background on its own worker.
         self._layout_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="layout")
         self._warm_up()
@@ -1437,7 +1368,6 @@ class OcrPipeline:
         self.arabic.recognize_batch([line])
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
         self._layout_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ API
@@ -1459,39 +1389,26 @@ class OcrPipeline:
 
         ("layout", PipelineResult)            page structure, no text yet
         ("cell",  (block_i, row_i, cell_i, Cell))   one per box, reading order
-        ("done",  PipelineResult)             final page (noise removed,
-                                              bullets marked)
+                                              (a box may be sent twice in
+                                              "mixed": UTRNet, then EasyOCR)
+        ("status", "ai_correcting")           rough draft done, vision model
+                                              correcting (only with Gemini)
+        ("done",  PipelineResult)             final page: rough draft
+                                              (formatted_text) + Markdown
 
         ``language`` (chosen by the user in the app):
-          * "mixed"  - both engines read every box, the confidence router
-                       decides (default, unchanged behaviour);
-          * "urdu"   - only UTRNet reads the boxes (page known to be Urdu);
-          * "arabic" - only PaddleOCR reads the boxes; also much faster,
-                       because the slow UTRNet is skipped.
+          * "urdu"   - every box is read by UTRNet;
+          * "arabic" - every box is read by EasyOCR;
+          * "mixed"  - UTRNet reads every box, boxes whose reading looks
+                       Arabic (:func:`looks_arabic`) are read by EasyOCR.
 
-        ``ai_correct``: read the page with Gemini (text, boxes and layout in
-        one request; needs GEMINI_API_KEY). Yields ("status", "ai_reading")
-        first. If Gemini is unavailable (no key, no internet, quota used up)
-        the page is read by the local engines as above.
+        ``ai_correct``: send the original image + rough draft to Gemini for
+        correction to Markdown (needs GEMINI_API_KEY). If Gemini is
+        unavailable the rough draft is returned as Markdown.
         """
         if language not in self.LANGUAGES:
             raise ValueError(f"language must be one of {self.LANGUAGES}, got {language!r}")
         t0 = time.perf_counter()
-        ai_status = "off"
-        if ai_correct and self.gemini is not None:
-            yield "status", "ai_reading"
-            try:
-                result = self._read_with_gemini(image_bgr, language)
-                result.processing_ms = int((time.perf_counter() - t0) * 1000)
-                logger.info("Gemini (%s) read %d lines in %d ms", result.ai_correction,
-                            sum(len(b.rows) for b in result.blocks), result.processing_ms)
-                yield "layout", result
-                yield "done", result
-                return
-            except Exception as exc:  # network, quota, bad answer: local OCR instead
-                logger.warning("Gemini page reading failed, using local OCR: %s", exc)
-                ai_status = f"failed: {str(exc)[:160]}"
-            yield "status", "local_ocr"
         # Orientation: detect text boxes on the photo as it is; if they are
         # mostly tall (lines running top-to-bottom) the page is turned 90 deg.
         # Then 0 vs 180 deg is checked on the detected boxes. Only a sideways
@@ -1526,60 +1443,61 @@ class OcrPipeline:
                     len(blocks), (time.perf_counter() - t0) * 1000, turns * 90)
         yield "layout", result
 
-        # Reading order: block by block, row by row, right-to-left in a row.
+        # Rough draft. Reading order: block by block, row by row (top to
+        # bottom), right-to-left within a row.
         order = [(bi, ri, ci, cell) for bi, b in enumerate(blocks)
                  for ri, r in enumerate(b.rows) for ci, cell in enumerate(r.cells)]
+        to_arabic = []                                # mixed: boxes UTRNet read as Arabic
         for start in range(0, len(order), self.CHUNK):
             chunk = order[start:start + self.CHUNK]
             images = [self._crop(pre, item[3].box) for item in chunk]
-            # Mixed: send the SAME crops to BOTH engines at the same time.
-            # A fixed language runs only that language's engine.
-            def skipped(engine) -> List[EngineResult]:
-                return [EngineResult(engine.name, engine.language, "", 0.0) for _ in images]
-
-            fut_u = self._executor.submit(self.urdu.recognize_batch, images) \
-                if language != LANG_ARABIC else None
-            fut_a = self._executor.submit(self.arabic.recognize_batch, images) \
-                if language != LANG_URDU else None
-            urdu_results = fut_u.result() if fut_u else skipped(self.urdu)
-            arabic_results = fut_a.result() if fut_a else skipped(self.arabic)
-            for (bi, ri, ci, cell), u, a in zip(chunk, urdu_results, arabic_results):
-                if language == LANG_URDU:
-                    accepted = u
-                elif language == LANG_ARABIC:
-                    accepted = a
-                else:
-                    accepted, _ = route_by_confidence(u, a)
-                cell.text = accepted.text
-                cell.language = accepted.language if accepted.text else "unknown"
-                cell.engine = accepted.engine if accepted.text else ""
-                cell.confidence = accepted.confidence
-                cell.candidates = {LANG_URDU: u, LANG_ARABIC: a}
-                cell.done = True
-                yield "cell", (bi, ri, ci, cell)
+            engine = self.arabic if language == LANG_ARABIC else self.urdu
+            for item, image, res in zip(chunk, images, engine.recognize_batch(images)):
+                self._accept(item[3], res)
+                if language == "mixed" and looks_arabic(res.text):
+                    to_arabic.append((item, image))
+                yield "cell", item
+        if to_arabic:
+            t_ar = time.perf_counter()
+            for start in range(0, len(to_arabic), self.CHUNK):
+                chunk = to_arabic[start:start + self.CHUNK]
+                for (item, _), res in zip(chunk, self.arabic.recognize_batch([im for _, im in chunk])):
+                    self._accept(item[3], res)
+                    yield "cell", item
+            logger.info("EasyOCR re-read %d Arabic boxes in %d ms", len(to_arabic),
+                        (time.perf_counter() - t_ar) * 1000)
 
         apply_layout_hints(result.blocks, fut_hints.result())
         self._finalise(result)
-        result.ai_correction = ai_status
+        logger.info("rough draft: %d boxes in %d ms", len(order), (time.perf_counter() - t0) * 1000)
+
+        # Vision-LLM correction: original image + rough draft -> Markdown.
+        if ai_correct and self.gemini is not None:
+            yield "status", "ai_correcting"
+            t_ai = time.perf_counter()
+            try:
+                result.corrected_markdown = self.gemini.correct(image_bgr, result.formatted_text())
+                result.ai_correction = self.gemini.last_model
+                logger.info("Gemini (%s) corrected the draft in %d ms", result.ai_correction,
+                            (time.perf_counter() - t_ai) * 1000)
+            except Exception as exc:  # network, quota, bad answer: keep the draft
+                logger.warning("Gemini correction failed, returning the rough draft: %s", exc)
+                result.ai_correction = f"failed: {str(exc)[:160]}"
         result.processing_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info("processed %d boxes in %d ms", len(order), result.processing_ms)
+        logger.info("page done in %d ms", result.processing_ms)
         yield "done", result
 
-    # ------------------------------------------------------------ helpers
-    def _read_with_gemini(self, image_bgr: np.ndarray, language: str) -> PipelineResult:
-        """Whole page read by Gemini. Boxes are in uploaded-image pixels, so
-        the 'pre-processing' is the identity (no rotation, no deskew)."""
-        h, w = image_bgr.shape[:2]
-        page = self.gemini.read_page(image_bgr)
-        blocks = blocks_from_gemini(page, w, h, language, engine="Gemini")
-        if not blocks:
-            raise RuntimeError("Gemini found no text on the page")
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        pre = ip.PreprocessResult(color=image_bgr, gray=gray, binary=gray, skew_angle=0.0,
-                                  original_size=(w, h))
-        return PipelineResult(pre=pre, blocks=blocks, layout_engine="gemini",
-                              processing_ms=0, rotation=0, ai_correction=self.gemini.last_model)
+    @staticmethod
+    def _accept(cell: Cell, res: EngineResult) -> None:
+        """Store a recogniser's reading of a box in the cell."""
+        cell.text = res.text
+        cell.language = res.language if res.text else "unknown"
+        cell.engine = res.engine if res.text else ""
+        cell.confidence = res.confidence
+        cell.candidates[res.language] = res
+        cell.done = True
 
+    # ------------------------------------------------------------ helpers
     def _page_boxes(self, pre: ip.PreprocessResult) -> List[ip.Box]:
         """Auto-cropped text boxes of the main page only."""
         boxes = self.detector.detect(pre.gray, pre.binary)
@@ -1667,10 +1585,10 @@ class OcrPipeline:
         return wide / (wide + tall) if wide + tall else 0.5
 
     def _is_upside_down(self, pre: ip.PreprocessResult, boxes: List[ip.Box]) -> bool:
-        """Read a sample of the DETECTED text boxes with the fast PaddleOCR
-        recogniser as they are and turned 180 deg. Upside-down Arabic-script
-        text gets a clearly lower confidence. Using detector boxes (not raw
-        ink) keeps page borders and background patterns out of the test."""
+        """Read a sample of the DETECTED text boxes with UTRNet as they are
+        and turned 180 deg. Upside-down Arabic-script text gets a clearly
+        lower confidence. Using detector boxes (not raw ink) keeps page
+        borders and background patterns out of the test."""
         if not boxes:
             return False
         median_h = float(np.median([b[3] - b[1] for b in boxes]))
@@ -1679,8 +1597,8 @@ class OcrPipeline:
         sample = sorted(textlike or boxes, key=lambda b: b[2] - b[0],
                         reverse=True)[:self.ORIENTATION_SAMPLE_LINES]
         crops = [self._crop(pre, b) for b in sample]
-        upright = self.arabic.recognize_batch(crops)
-        flipped = self.arabic.recognize_batch([np.ascontiguousarray(np.rot90(c, 2)) for c in crops])
+        upright = self.urdu.recognize_batch(crops)
+        flipped = self.urdu.recognize_batch([np.ascontiguousarray(np.rot90(c, 2)) for c in crops])
         up = float(np.mean([r.confidence for r in upright]))
         down = float(np.mean([r.confidence for r in flipped]))
         logger.info("orientation check on %d boxes: upright=%.3f flipped=%.3f", len(crops), up, down)

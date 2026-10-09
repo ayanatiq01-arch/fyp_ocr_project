@@ -301,7 +301,7 @@ class _PageCard extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.only(top: 6),
                 child: MarkdownPage(
-                  markdown: pageMarkdown(page.result, isLow: isLow),
+                  markdown: displayMarkdown(page.result, isLow: isLow),
                   language: pageLanguage(page.result),
                 ),
               ),
