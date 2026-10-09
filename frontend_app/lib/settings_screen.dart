@@ -319,7 +319,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: Text('• $line', style: Theme.of(context).textTheme.bodySmall),
                 ),
               const SizedBox(height: 8),
-              Text('Version 4.0.0', style: Theme.of(context).textTheme.bodySmall),
+              Text('Version 4.0.1', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ),

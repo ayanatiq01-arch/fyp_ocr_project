@@ -81,6 +81,7 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
   StreamSubscription<OcrEvent>? _scan;
   _Phase _phase = _Phase.reading;
   bool _retried = false; // one automatic retry after finding the server again
+  bool _adding = false; // a partial selection is being corrected
   String _stage = ''; // 'ai_correcting' (vision model) or 'searching' (server)
   String _error = '';
   OcrResult? _result;
@@ -147,6 +148,10 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
                   if (c.text.isNotEmpty) Rect.fromLTRB(c.bbox.x1, c.bbox.y1, c.bbox.x2, c.bbox.y2),
               ];
               _phase = _Phase.selecting;
+              if (_words.isNotEmpty) {
+                _anchor = 0; // whole page selected: "Add to Book" adds the corrected page
+                _focus = _words.length - 1;
+              }
           }
         });
       },
@@ -365,8 +370,42 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
 
   String get _selectedText => _hasSelection ? _selectionResult().currentText() : '';
 
-  void _addToBook() {
-    final page = widget.session.addPage(_selectionResult(), widget.image.path);
+  bool get _wholePage => _lo == 0 && _hi == _words.length - 1;
+
+  Future<void> _addToBook() async {
+    var result = _selectionResult();
+    if (!_wholePage) {
+      // A part of the page: its rough text is corrected by the vision model
+      // too (the page's corrected Markdown cannot be split into boxes).
+      setState(() => _adding = true);
+      try {
+        final (md, model) =
+            await widget.settings.api.correctSelection(widget.image, result.currentText());
+        result = OcrResult(
+          requestId: result.requestId,
+          imageWidth: result.imageWidth,
+          imageHeight: result.imageHeight,
+          rotation: result.rotation,
+          skewAngle: result.skewAngle,
+          layoutEngine: result.layoutEngine,
+          blocks: result.blocks,
+          formattedText: result.formattedText,
+          processingMs: result.processingMs,
+          totalCells: result.totalCells,
+          aiCorrection: model,
+          markdown: md,
+        );
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('Could not correct the selection - added as read. '
+                  '${e is ApiException ? e.message : e}')));
+        }
+      }
+      if (!mounted) return;
+      setState(() => _adding = false);
+    }
+    final page = widget.session.addPage(result, widget.image.path);
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text('${page.header} added to the book')));
     Navigator.of(context).pop(true);
@@ -573,9 +612,12 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
         ],
         const SizedBox(height: 12),
         FilledButton.icon(
-          onPressed: _hasSelection ? _addToBook : null,
-          icon: const Icon(Icons.auto_stories),
-          label: Text('Add to Book as Page $nextPage'),
+          onPressed: _hasSelection && !_adding ? _addToBook : null,
+          icon: _adding
+              ? const SizedBox(
+                  width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.5))
+              : const Icon(Icons.auto_stories),
+          label: Text(_adding ? 'Finding text...' : 'Add to Book as Page $nextPage'),
           style: FilledButton.styleFrom(minimumSize: const Size(0, 54)),
         ),
       ],

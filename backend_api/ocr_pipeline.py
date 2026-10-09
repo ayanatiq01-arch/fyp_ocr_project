@@ -444,13 +444,19 @@ class GeminiMarkdownCorrector:
         return {"inline_data": {"mime_type": "image/jpeg",
                                 "data": base64.b64encode(buf.tobytes()).decode("ascii")}}
 
-    def correct(self, image_bgr: np.ndarray, rough_text: str) -> str:
-        """Corrected page as Markdown (with the book's line breaks)."""
+    def correct(self, image_bgr: np.ndarray, rough_text: str, part: bool = False) -> str:
+        """Corrected page as Markdown (with the book's line breaks).
+
+        ``part``: the rough text is only a part of the page the user
+        selected; only that part is returned."""
+        selection = ("IMPORTANT: the rough text below is only a PART of the page that the user "
+                     "selected. Find that part in the image and return ONLY that part, "
+                     "corrected - nothing else from the page.\n\n") if part else ""
         body = {
             "systemInstruction": {"parts": [{"text": self.SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [
                 self._image_part(image_bgr),
-                {"text": "Rough text extracted by the local OCR models (top to bottom, each "
+                {"text": selection + "Rough text extracted by the local OCR models (top to bottom, each "
                          "line right to left):\n\n" + (rough_text.strip() or "(nothing found)")
                          + "\n\n" + self.MARKS},
             ]}],

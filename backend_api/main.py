@@ -315,6 +315,35 @@ def ocr(request: Request, file: UploadFile = File(..., description="Whole page p
         _cleanup(temp_path)
 
 
+class CorrectResponse(BaseModel):
+    markdown: str = Field(..., description="The selected part, corrected, as Markdown")
+    ai_correction: str = Field(..., description="Gemini model that corrected it")
+
+
+@app.post("/api/v1/correct", response_model=CorrectResponse)
+def correct(request: Request, file: UploadFile = File(..., description="The page photo"),
+            rough_text: str = Form(..., description="Rough OCR text of the SELECTED part")
+            ) -> CorrectResponse:
+    """Corrects a part of a page the user selected in the app: the photo +
+    the rough text of the selection go to the vision model, which returns
+    only that part, corrected, as Markdown."""
+    gemini = request.app.state.pipeline.gemini
+    if gemini is None:
+        raise HTTPException(503, "Correction is not available (no GEMINI_API_KEY)")
+    if not rough_text.strip():
+        raise HTTPException(422, "rough_text is empty")
+    request_id, temp_path, image = _read_upload(file)
+    try:
+        md = gemini.correct(image, rough_text, part=True)
+        logger.info("correct %s: %d chars by %s", request_id, len(md), gemini.last_model)
+        return CorrectResponse(markdown=md, ai_correction=gemini.last_model)
+    except Exception as exc:
+        logger.warning("correct %s failed: %s", request_id, exc)
+        raise HTTPException(502, "Correction failed, the rough text is kept") from exc
+    finally:
+        _cleanup(temp_path)
+
+
 @app.post("/api/v1/ocr/stream")
 def ocr_stream(request: Request, file: UploadFile = File(..., description="Whole page photo"),
                language: str = Form("mixed", description=LANGUAGE_HELP),

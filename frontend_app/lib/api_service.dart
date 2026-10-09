@@ -457,6 +457,30 @@ class ApiService {
     }
   }
 
+  /// Corrects a part of a page the user selected: the photo + the rough
+  /// text of the selection go to the server's vision model. Returns
+  /// (corrected Markdown, model name).
+  Future<(String, String)> correctSelection(File image, String roughText) async {
+    final request = http.MultipartRequest('POST', Uri.parse('$baseUrl/api/v1/correct'))
+      ..fields['rough_text'] = roughText
+      ..files.add(await http.MultipartFile.fromPath('file', image.path));
+    try {
+      final response = await _client.send(request).timeout(const Duration(seconds: 120));
+      final body = await response.stream.bytesToString();
+      if (response.statusCode != 200) {
+        throw ApiException(_errorDetail(body), statusCode: response.statusCode);
+      }
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      return (json['markdown'] as String, json['ai_correction'] as String? ?? '');
+    } on TimeoutException {
+      throw ApiException('The server did not respond. Is it running?');
+    } on SocketException catch (e) {
+      throw ApiException('Cannot reach the server at $baseUrl (${e.message}).');
+    } on http.ClientException catch (e) {
+      throw ApiException('Network error: ${e.message}');
+    }
+  }
+
   /// Extracts FastAPI's {"detail": ...} message when present.
   static String _errorDetail(String body) {
     try {
