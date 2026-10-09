@@ -240,7 +240,7 @@ def health(request: Request) -> dict:
         "status": "ok",
         "models": {
             "urdu": "UTRNet-Large (HRNet-DBiLSTM-CTC)",
-            "arabic": pipeline.arabic.model_name,
+            "arabic": pipeline.arabic.name,
             "detection": "PP-OCRv5_mobile_det",
             "layout": pipeline.layout.engine,
         },
