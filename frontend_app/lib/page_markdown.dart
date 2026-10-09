@@ -86,7 +86,7 @@ String pageMarkdown(OcrResult result, {bool Function(double confidence)? isLow})
 /// corrected Markdown, or the rough draft as Markdown ([isLow] marks the
 /// uncertain words of a rough draft).
 String displayMarkdown(OcrResult result, {bool Function(double confidence)? isLow}) =>
-    result.isCorrected ? result.markdown : pageMarkdown(result, isLow: isLow);
+    pageMarkdown(result, isLow: result.isCorrected ? null : isLow);
 
 final _mdTableRule = RegExp(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$');
 final _mdEscape = RegExp(r'\\([\\`*_\[\]<>|~=#+\-.!()])');

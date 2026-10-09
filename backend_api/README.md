@@ -2,8 +2,8 @@
 
 | File | Purpose |
 |---|---|
-| `main.py` | FastAPI app: `POST /api/v1/ocr/stream` (live NDJSON), `POST /api/v1/ocr`, `GET /health` |
-| `ocr_pipeline.py` | Text detection → rows/blocks/tables → **UTRNet (Urdu) / EasyOCR (Arabic)** → rough draft → **Gemini vision correction** (original image + draft → Markdown) |
+| `main.py` | FastAPI app: `POST /api/v1/ocr/stream` (live NDJSON), `POST /api/v1/ocr`, `POST /api/v1/correct` (correct a selected part), `POST /api/v1/log` (app error reports, written to `server.log`), `GET /health` |
+| `ocr_pipeline.py` | Text detection → rows/blocks/tables → **UTRNet (Urdu) / EasyOCR (Arabic)** → rough draft → **Gemini vision correction** (original image + draft → corrected lines with their boxes and layout → Markdown) |
 | `.env` | `GEMINI_API_KEY=...` (git-ignored, never committed) |
 | `test_correction.py` | Unit tests for routing, rough-draft Markdown and the Gemini correction step, no network needed (`venv\Scripts\python -m unittest test_correction -v`) |
 | `image_processing.py` | OpenCV: 90°/180°/270° page orientation, deskew, shadow removal, adaptive binarisation, denoise, line segmentation |
@@ -35,10 +35,9 @@
    - The user part of the request adds two instructions:
      - keep the rough draft's line breaks;
      - keep every printed mark: āyah numbers (۝۹), rukūʿ ؏, waqf marks, quotation marks, footnotes.
-   - The answer is the page as **Markdown** (`markdown`). Code fences, HTML tags such as `<u>` and invisible direction marks are removed. Text lines get hard line breaks, so the book's line breaks show in Markdown.
-   - If Gemini is unavailable (no key, no internet, quota used up for every model), `markdown` is the rough draft as Markdown, and `ai_correction` says `failed: …`.
-
-The app shows the corrected Markdown, and its PDF and Word export use it. If the user selects only part of the page, the selected words of the rough draft are used, because the corrected Markdown cannot be split back into boxes.
+   - The answer is **structured JSON** (`responseSchema`): blocks (Title / Text / List / Table), rows (one per printed line) and cells, each with the corrected text and its `box_2d` on the photo (0–1000 scale).
+   - The server turns this answer into the page's blocks, rows and boxes (`blocks_from_gemini`), and builds `markdown` from the same blocks. So the **boxes, layout and text all come from the API**, and the app's boxes, selection, copy, book page, PDF and Word export all show the same corrected lines.
+   - If Gemini is unavailable (no key, no internet, quota used up for every model), the rough draft and the local boxes are returned, and `ai_correction` says `failed: …`. Selecting part of such a page sends the part to `POST /api/v1/correct`.
 
 ## Setup (Windows, Python 3.11)
 
@@ -137,7 +136,13 @@ The stream sends:
 
 ## Known limitations (measured, not guessed)
 
-- **Speed (CPU only).** On this dual-core i5 laptop with 8 GB RAM, the Quran tafsīr page (21 boxes, 7 of them Arabic āyāt, `mixed`) took about **180–190 s**:
+- **Speed (CPU only).** On this dual-core i5 laptop with 8 GB RAM, after the speed changes below, a full `mixed` page takes **about 96–106 s** (measured on two of the user's pages). Changes:
+  - PaddleOCR sets torch to 1 thread; UTRNet / EasyOCR now reset the thread count before every batch;
+  - EasyOCR's second low-contrast pass is off (`contrast_ths=0`, about 30% faster);
+  - EasyOCR runs on a thread at the same time as UTRNet;
+  - the upside-down check (~26 s) and LayoutParser are skipped when Gemini corrects, because Gemini gives the layout and boxes.
+
+  The target of under 90 s is not reached yet: UTRNet takes about 2–3 s per line on this CPU. `language=urdu` (no EasyOCR) is faster. Before the speed changes, the Quran tafsīr page (21 boxes, 7 of them Arabic āyāt, `mixed`) took about **180–190 s**:
 
   | Step | Time |
   |---|---|

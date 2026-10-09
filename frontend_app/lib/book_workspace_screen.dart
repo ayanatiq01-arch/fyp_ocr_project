@@ -108,14 +108,31 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
   Future<void> _export(ExportFormat format) async {
     if (_session.isEmpty) return;
     setState(() => _exporting = true);
+    final api = widget.settings.api;
     try {
-      final file = await ExportService.exportBook(context, _session, format);
-      if (!mounted || file == null) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved ${file.uri.pathSegments.last}')));
-    } catch (e) {
+      final (saved, file) = await ExportService.exportBook(context, _session, format,
+          report: (where, error) => api.reportError(where, error));
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Export failed: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        duration: const Duration(seconds: 8),
+        content: Text('Saved to $saved'),
+        action: SnackBarAction(
+          label: 'SHARE',
+          onPressed: () => ExportService.share(file, _session.title),
+        ),
+      ));
+    } catch (e, st) {
+      api.reportError('export-${format.name}', '$e\n${st.toString().split('\n').take(10).join('\n')}');
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: HarfColors.slate,
+          title: const Text('Export failed'),
+          content: SelectableText('$e'),
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+        ),
+      );
     } finally {
       if (mounted) setState(() => _exporting = false);
     }

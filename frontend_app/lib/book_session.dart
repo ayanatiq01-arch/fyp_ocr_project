@@ -14,7 +14,6 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api_service.dart';
-import 'page_markdown.dart';
 
 /// Script of the book (sent to the backend as "language").
 enum OcrLanguage {
@@ -52,7 +51,7 @@ class BookPage {
 
   /// Page text with paragraphs, bullets and table columns (TAB) preserved:
   /// from the corrected Markdown, or the rough draft.
-  String get text => result.isCorrected ? markdownToPlain(result.markdown) : result.currentText();
+  String get text => result.currentText();
 
   /// Header line used in the master document.
   String get header => '=== Page $number ===';

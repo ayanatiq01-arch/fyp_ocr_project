@@ -12,7 +12,8 @@ import numpy as np
 
 import ocr_pipeline
 from ocr_pipeline import (Block, Cell, EngineResult, GeminiMarkdownCorrector, Row,
-                          blocks_to_markdown, hard_line_breaks, looks_arabic, md_escape)
+                          blocks_from_gemini, blocks_to_markdown, hard_line_breaks,
+                          looks_arabic, md_escape)
 
 
 def cell(text, box=(0, 0, 10, 10), column=0):
@@ -60,6 +61,36 @@ class MarkdownTest(unittest.TestCase):
         md = "## عنوان\n\nپہلی سطر\nدوسری سطر\n\n- ایک\n- دو\n| a | b |"
         self.assertEqual(hard_line_breaks(md),
                          "## عنوان\n\nپہلی سطر  \nدوسری سطر\n\n- ایک\n- دو\n| a | b |")
+
+
+class BoxesFromApiTest(unittest.TestCase):
+    PAGE = {"blocks": [
+        {"type": "Title", "rows": [{"cells": [{"box_2d": [10, 300, 50, 700], "text": "ماہ ذی الحجہ"}]}]},
+        {"type": "Text", "rows": [
+            {"cells": [{"box_2d": [100, 100, 140, 900], "text": "اَشْهَدُ اَنْ لَّا اِلٰهَ اِلَّا اللّٰهُ"}]},
+            {"cells": [{"box_2d": [150, 100, 190, 900], "text": "عطا  فرمائے گا۔"}]}]},
+        {"type": "Table", "rows": [
+            {"cells": [{"column": 2, "box_2d": [300, 100, 340, 250], "text": "اس نے سنا"},
+                       {"column": 0, "box_2d": [300, 800, 340, 950], "text": "سَمِعَ"}]}]},
+        {"type": "Text", "rows": [{"cells": [{"box_2d": [1, 2], "text": "بلا"}]}]},   # bad box
+    ]}
+
+    def test_corrected_lines_boxes_and_layout(self):
+        blocks = blocks_from_gemini(self.PAGE, width=2000, height=1000)
+        self.assertEqual([b.type for b in blocks], ["Title", "Text", "Table"])
+        self.assertEqual(blocks[0].rows[0].cells[0].box, (600, 10, 1400, 50))   # pixels
+        self.assertEqual(blocks[1].rows[1].cells[0].text, "عطا فرمائے گا۔")       # spaces
+        self.assertEqual([c.language for r in blocks[1].rows for c in r.cells], ["arabic", "urdu"])
+        self.assertEqual(blocks[2].columns, 2)
+        self.assertEqual(blocks[2].text(), "سَمِعَ" + "\t" + "اس نے سنا")
+        self.assertTrue(all(c.done and c.engine == "Gemini" for b in blocks for r in b.rows
+                            for c in r.cells))
+
+    def test_markdown_is_built_from_the_same_lines(self):
+        md = blocks_to_markdown(blocks_from_gemini(self.PAGE, 1000, 1000))
+        self.assertTrue(md.startswith("## ماہ ذی الحجہ" + "\n\n"))
+        # the book's line break is kept (hard break: two spaces + newline)
+        self.assertIn("اَشْهَدُ اَنْ لَّا اِلٰهَ اِلَّا اللّٰهُ" + "  \n" + "عطا فرمائے گا۔", md)
 
 
 class FakeResponse:
@@ -120,6 +151,16 @@ class CorrectorTest(unittest.TestCase):
         parts = body["contents"][0]["parts"]
         self.assertIn("inline_data", parts[0])                       # the original image
         self.assertIn("اردو ادپ\nپہلی سطر", parts[1]["text"])        # the rough draft
+
+    def test_corrected_page_request_and_answer(self):
+        page = {"blocks": [{"type": "Text", "rows": [
+            {"cells": [{"box_2d": [0, 0, 10, 10], "text": "ذی الحجہ"}]}]}]}
+        c = corrector({"m1": [FakeResponse(200, reply(json.dumps(page, ensure_ascii=False)))]})
+        self.assertEqual(c.correct_page(IMAGE, "ری الجھ"), page)
+        body = c._http.bodies[0]
+        self.assertEqual(body["systemInstruction"]["parts"][0]["text"], c.SYSTEM_PROMPT)
+        self.assertEqual(body["generationConfig"]["responseSchema"], c.SCHEMA)
+        self.assertIn("ری الجھ", body["contents"][0]["parts"][1]["text"])   # rough draft sent
 
     def test_code_fences_html_tags_and_direction_marks_are_removed(self):
         c = corrector({"m1": [FakeResponse(200, reply(

@@ -19,7 +19,6 @@ import 'package:image_picker/image_picker.dart';
 import 'api_service.dart';
 import 'app_settings.dart';
 import 'book_session.dart';
-import 'page_markdown.dart';
 import 'theme.dart';
 
 class SelectTextScreen extends StatefulWidget {
@@ -371,18 +370,13 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
 
   /// Text shown under the photo: the corrected page when the whole page
   /// is selected (that is what "Add to Book" saves), else the selected words.
-  String get _selectedText {
-    if (!_hasSelection) return '';
-    final r = _result;
-    if (_wholePage && r != null && r.isCorrected) return markdownToPlain(r.markdown);
-    return _selectionResult().currentText();
-  }
+  String get _selectedText => _hasSelection ? _selectionResult().currentText() : '';
 
   bool get _wholePage => _lo == 0 && _hi == _words.length - 1;
 
   Future<void> _addToBook() async {
     var result = _selectionResult();
-    if (!_wholePage) {
+    if (!_wholePage && !(_result?.isCorrected ?? false)) {
       // A part of the page: its rough text is corrected by the vision model
       // too (the page's corrected Markdown cannot be split into boxes).
       setState(() => _adding = true);

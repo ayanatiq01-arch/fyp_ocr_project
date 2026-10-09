@@ -481,6 +481,19 @@ class ApiService {
     }
   }
 
+  /// Reports an app error to the server log (POST /api/v1/log), so it can
+  /// be looked into without the phone. Never throws.
+  Future<void> reportError(String where, String message) async {
+    try {
+      await _client.post(Uri.parse('$baseUrl/api/v1/log'), body: {
+        'where': where,
+        'message': message.length > 3900 ? message.substring(0, 3900) : message,
+      }).timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // The report is best effort.
+    }
+  }
+
   /// Extracts FastAPI's {"detail": ...} message when present.
   static String _errorDetail(String body) {
     try {

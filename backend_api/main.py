@@ -315,6 +315,14 @@ def ocr(request: Request, file: UploadFile = File(..., description="Whole page p
         _cleanup(temp_path)
 
 
+@app.post("/api/v1/log")
+def app_log(message: str = Form(..., max_length=4000), where: str = Form("app", max_length=80)):
+    """Errors reported by the app (e.g. a failed PDF export) are written to
+    server.log, so they can be looked into without the phone."""
+    logger.warning("APP ERROR [%s]: %s", where, message)
+    return {"ok": True}
+
+
 class CorrectResponse(BaseModel):
     markdown: str = Field(..., description="The selected part, corrected, as Markdown")
     ai_correction: str = Field(..., description="Gemini model that corrected it")

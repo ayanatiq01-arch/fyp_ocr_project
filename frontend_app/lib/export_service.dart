@@ -10,7 +10,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/services.dart' show MethodChannel, rootBundle;
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/widgets.dart' show BuildContext;
 import 'package:path_provider/path_provider.dart';
@@ -409,14 +409,17 @@ enum ExportFormat { pdf, docx }
 class ExportService {
   const ExportService._();
 
-  /// Builds the file for the whole book, saves it in the app's documents
-  /// folder and opens the share sheet. Returns the saved file, or null if
-  /// the user left the export screen.
+  static const _downloads = MethodChannel('harfscan/downloads');
+
+  /// Builds the file for the whole book and saves it in the phone's
+  /// Downloads folder (Download/HarfScan). Returns where it was saved and
+  /// the file in the app's folder (for sharing).
   ///
   /// The PDF is made from the pages as the app draws them (same fonts and
   /// layout as on screen); if that fails, from the text with the bundled
-  /// Naskh font.
-  static Future<File?> exportBook(BuildContext context, BookSession session, ExportFormat format) async {
+  /// Naskh font. Every failure is also reported to the server log.
+  static Future<(String, File)> exportBook(BuildContext context, BookSession session,
+      ExportFormat format, {void Function(String where, String error)? report}) async {
     final pages = session.pages.map(ExportPage.of).toList();
     final Uint8List bytes;
     final String extension;
@@ -425,8 +428,9 @@ class ExportService {
         List<List<Uint8List>>? images;
         try {
           images = await capturePages(context, session.pages);
-        } catch (e) {
+        } catch (e, st) {
           debugPrint('Rendered PDF not possible, using the text PDF: $e');
+          report?.call('pdf-render', '$e\n${st.toString().split('\n').take(8).join('\n')}');
         }
         bytes = images != null && images.length == pages.length
             ? await buildImagePdf(images, title: session.title)
@@ -442,15 +446,27 @@ class ExportService {
         extension = 'docx';
     }
     final dir = await getApplicationDocumentsDirectory();
-    final stamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
-    final name = session.title.replaceAll(RegExp(r'[^\w\u0600-\u06FF -]'), '').trim();
-    final file = File('${dir.path}/${name.isEmpty ? 'HarfScan_Book' : name}_$stamp.$extension');
+    final stamp = DateTime.now().toIso8601String().substring(0, 19).replaceAll(RegExp(r'[:T]'), '-');
+    // ASCII file name: some apps / file managers fail on Urdu file names.
+    final ascii = session.title.replaceAll(RegExp(r'[^A-Za-z0-9 _-]'), '').trim().replaceAll(' ', '_');
+    final fileName = '${ascii.isEmpty ? 'HarfScan_Book' : ascii}_$stamp.$extension';
+    final file = File('${dir.path}/$fileName');
     await file.writeAsBytes(bytes, flush: true);
 
-    await SharePlus.instance.share(ShareParams(
-      files: [XFile(file.path)],
-      subject: '${session.title} (${session.pageCount} pages)',
-    ));
-    return file;
+    final mime = format == ExportFormat.pdf
+        ? 'application/pdf'
+        : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    try {
+      final saved = await _downloads
+          .invokeMethod<String>('save', {'path': file.path, 'name': fileName, 'mime': mime});
+      return (saved ?? fileName, file);
+    } catch (e) {
+      report?.call('save-downloads', '$e');
+      rethrow;
+    }
   }
+
+  /// Opens the share sheet (WhatsApp, Drive, email ...) for an exported file.
+  static Future<void> share(File file, String subject) =>
+      SharePlus.instance.share(ShareParams(files: [XFile(file.path)], subject: subject));
 }

@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Release builds need this to reach the FastAPI backend. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Saving exports to Downloads on Android 9 and older (10+ uses MediaStore). -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
 
     <!-- usesCleartextTraffic: the backend runs on plain http:// in the local network. -->
     <application

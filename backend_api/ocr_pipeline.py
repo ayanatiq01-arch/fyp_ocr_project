@@ -282,6 +282,8 @@ class UTRNetRecognizer:
 
     def recognize_batch(self, images: Sequence[np.ndarray]) -> List[EngineResult]:
         """Recognise grayscale crops (each at its own width)."""
+        # Paddle resets PyTorch to 1 thread when it loads / detects; use all.
+        self._torch.set_num_threads(TORCH_THREADS)
         results = []
         for gray in images:
             x = self._to_tensor(gray)
@@ -315,12 +317,17 @@ class EasyOcrArabicRecognizer:
         logger.info("EasyOCR Arabic recogniser loaded")
 
     def recognize_batch(self, images: Sequence[np.ndarray]) -> List[EngineResult]:
+        import torch
+        torch.set_num_threads(TORCH_THREADS)   # Paddle resets it to 1
         results = []
         for gray in images:
             h, w = gray.shape[:2]
             with self._lock:
+                # contrast_ths=0: no second pass with adjusted contrast. EasyOCR
+                # repeats every line scored below 0.1, i.e. almost every Arabic
+                # line: 30 % slower, same text on the test lines.
                 parts = self.reader.recognize(gray, horizontal_list=[[0, w, 0, h]], free_list=[],
-                                              detail=1, paragraph=False)
+                                              detail=1, paragraph=False, contrast_ths=0.0)
             text = " ".join(str(p[1]).strip() for p in parts if str(p[1]).strip())
             conf = float(np.mean([p[2] for p in parts])) if parts and text else 0.0
             results.append(EngineResult(self.name, self.language, text, conf))
@@ -374,6 +381,73 @@ def hard_line_breaks(md: str) -> str:
     return "\n".join(out)
 
 
+# Gemini gives no per-word score; its corrected text is reported with this.
+GEMINI_CONFIDENCE = 0.99
+
+
+def blocks_from_gemini(page: dict, width: int, height: int, language: str = "mixed",
+                       engine: str = "Gemini") -> List["Block"]:
+    """Turns the vision model's JSON page ({"blocks": [{type, rows:
+    [{is_bullet, cells: [{column, box_2d, text}]}]}]}) into Block / Row /
+    Cell. ``box_2d`` is [ymin, xmin, ymax, xmax] on a 0-1000 scale of the
+    photo; boxes are converted to pixels of the photo (``width`` x
+    ``height``). The language of each line is "arabic" for Arabic text
+    (:func:`looks_arabic`), else "urdu" - unless the user chose one."""
+    def to_box(b) -> Optional[ip.Box]:
+        try:
+            y1, x1, y2, x2 = (min(1000, max(0, int(v))) for v in b[:4])
+        except (TypeError, ValueError):
+            return None
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1 * width // 1000, y1 * height // 1000,
+                -(-x2 * width // 1000), -(-y2 * height // 1000))
+
+    blocks: List[Block] = []
+    for b in page.get("blocks", []):
+        kind = b.get("type") if b.get("type") in ("Title", "Text", "List", "Table") else "Text"
+        rows: List[Row] = []
+        for r in b.get("rows", []):
+            cells = []
+            for c in r.get("cells", []):
+                text = " ".join(str(c.get("text", "")).split())
+                box = to_box(c.get("box_2d"))
+                if not text or box is None:
+                    continue
+                if language in (LANG_URDU, LANG_ARABIC):
+                    lang = language
+                else:
+                    lang = LANG_ARABIC if looks_arabic(text) else LANG_URDU
+                result = EngineResult(engine, lang, text, GEMINI_CONFIDENCE)
+                cells.append(Cell(box=box, column=int(c.get("column") or 0), text=text,
+                                  language=lang, engine=engine, confidence=GEMINI_CONFIDENCE,
+                                  candidates={lang: result}, done=True))
+            if not cells:
+                continue
+            if kind == "Table":
+                cells.sort(key=lambda c: c.column)
+            rows.append(Row(box=ip.union_box([c.box for c in cells]), cells=cells,
+                            is_bullet=bool(r.get("is_bullet"))))
+        if not rows:
+            continue
+        block = Block(box=ip.union_box([r.box for r in rows]), type=kind, rows=rows)
+        if kind == "Table":
+            used = sorted({c.column for r in rows for c in r.cells})
+            remap = {old: new for new, old in enumerate(used)}
+            for r in rows:
+                for c in r.cells:
+                    c.column = remap[c.column]
+            block.columns = len(used)
+        else:
+            for r in rows:                      # one cell per line outside tables
+                for c in r.cells:
+                    c.column = 0
+        blocks.append(block)
+    return blocks
+
+
 class GeminiMarkdownCorrector:
     """The final correction layer: the ORIGINAL full page image and the
     rough draft from the local OCR go to a Gemini Flash vision model in a
@@ -407,6 +481,33 @@ class GeminiMarkdownCorrector:
         "marks (\u0637 \u062c \u0645 \u0644\u0627 \u06da \u06d6 \u06d7), inverted commas and quotation "
         "marks (\u201c \u201d \u2018 \u2019 \u00ab \u00bb), brackets ( ) \ufd3e \ufd3f, footnote markers, "
         "the page number, harakat as printed and all punctuation (\u060c \u061b \u061f \u06d4).")
+
+    # The corrected page comes back as structure (the server builds the
+    # Markdown from it), so the boxes, the text and the format the app shows
+    # all come from the same answer.
+    LAYOUT = (
+        "Return the corrected page in the JSON structure of the response schema (the "
+        "server turns it into Markdown): blocks in reading order (top to bottom; when "
+        "regions sit side by side, the right-hand one first). Block type: Title (a heading), "
+        "Text (paragraph), List (bulleted or numbered items), Table. Each row is ONE printed "
+        "line - exactly the line breaks of the page. In Text / Title / List blocks a row has "
+        "one cell for the whole line; in Table blocks one cell per column, column 0 = the "
+        "RIGHT-most column. For every cell give box_2d = [ymin, xmin, ymax, xmax] on a "
+        "0-1000 scale of this image, tight around that text, and the corrected text. If a "
+        "line starts with a bullet symbol set is_bullet true and leave the symbol out. "
+        "Include headers, page numbers and every line.")
+    SCHEMA = {"type": "OBJECT", "properties": {"blocks": {"type": "ARRAY", "items": {
+        "type": "OBJECT", "properties": {
+            "type": {"type": "STRING", "enum": ["Title", "Text", "List", "Table"]},
+            "rows": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                "is_bullet": {"type": "BOOLEAN"},
+                "cells": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                    "column": {"type": "INTEGER"},
+                    "box_2d": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    "text": {"type": "STRING"}},
+                    "required": ["box_2d", "text"]}}},
+                "required": ["cells"]}}},
+        "required": ["type", "rows"]}}}, "required": ["blocks"]}
 
     def __init__(self, api_key: str, models: Sequence[str] = tuple(GEMINI_MODELS)):
         import requests
@@ -467,6 +568,44 @@ class GeminiMarkdownCorrector:
             },
         }
         return hard_line_breaks(self._post(body, self._parse_markdown))
+
+    def correct_page(self, image_bgr: np.ndarray, rough_text: str) -> dict:
+        """The corrected page as structure: blocks / rows (= printed lines) /
+        cells with box_2d (0-1000) and corrected text."""
+        body = {
+            "systemInstruction": {"parts": [{"text": self.SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [
+                self._image_part(image_bgr),
+                {"text": "Rough text extracted by the local OCR models (top to bottom, each "
+                         "line right to left):\n\n" + (rough_text.strip() or "(nothing found)")
+                         + "\n\n" + self.MARKS + "\n" + self.LAYOUT},
+            ]}],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+                "responseSchema": self.SCHEMA,
+                "mediaResolution": "MEDIA_RESOLUTION_HIGH",
+                "thinkingConfig": {"thinkingLevel": GEMINI_THINKING},
+            },
+        }
+        return self._post(body, self._parse_page)
+
+    @staticmethod
+    def _parse_page(data: dict) -> dict:
+        """The page JSON of a reply; raises if it is cut off, not valid JSON
+        or has no Urdu/Arabic text (that model's answer is then not used)."""
+        cand = data["candidates"][0]
+        reason = cand.get("finishReason", "STOP")
+        if reason != "STOP":
+            raise RuntimeError(f"answer incomplete ({reason})")
+        answer = "".join(p.get("text", "") for p in cand["content"].get("parts", [])
+                         if not p.get("thought"))
+        page = json.loads(answer)
+        if not isinstance(page, dict) or not isinstance(page.get("blocks"), list):
+            raise RuntimeError("answer has no blocks")
+        if not _ARABIC_SCRIPT_RE.search(answer):
+            raise RuntimeError("answer has no Urdu/Arabic text")
+        return page
 
     @staticmethod
     def _parse_markdown(data: dict) -> str:
@@ -1324,7 +1463,6 @@ class PipelineResult:
     processing_ms: int
     rotation: int = 0            # degrees CCW applied to make the page upright
     ai_correction: str = "off"   # Gemini model that corrected the draft; "off"; "failed: ..."
-    corrected_markdown: str = "" # the vision model's Markdown ("" = not corrected)
 
     def formatted_text(self) -> str:
         """The ROUGH DRAFT of the local OCR: boxes sorted top-to-bottom and
@@ -1333,9 +1471,9 @@ class PipelineResult:
         return "\n\n".join(t for t in (b.text() for b in self.blocks) if t)
 
     def markdown(self) -> str:
-        """The final page: the corrected Markdown, or - if the correction did
-        not run - the rough draft as Markdown (:func:`blocks_to_markdown`)."""
-        return self.corrected_markdown or blocks_to_markdown(self.blocks)
+        """The page as Markdown (:func:`blocks_to_markdown`): built from the
+        corrected blocks when the vision model ran, else from the draft."""
+        return blocks_to_markdown(self.blocks)
 
 
 class OcrPipeline:
@@ -1355,6 +1493,8 @@ class OcrPipeline:
         self.detector = TextDetector(device="gpu:0" if use_gpu else "cpu")
         self.layout = LayoutAnalyzer()
         self.gemini = GeminiMarkdownCorrector.from_env()
+        # EasyOCR re-reads Arabic boxes on its own worker, next to UTRNet.
+        self._arabic_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="easyocr")
         # LayoutParser runs in the background on its own worker.
         self._layout_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="layout")
         self._warm_up()
@@ -1374,6 +1514,7 @@ class OcrPipeline:
         self.arabic.recognize_batch([line])
 
     def close(self) -> None:
+        self._arabic_executor.shutdown(wait=False, cancel_futures=True)
         self._layout_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ API
@@ -1434,14 +1575,18 @@ class OcrPipeline:
                         100 * wide, 100 * wide_t)
             if wide_t > wide:
                 turns, flipped_turns, pre, boxes = 1, 3, pre_t, boxes_t
-        if self._is_upside_down(pre, boxes):
+        # With the vision correction the page (text, boxes, layout) is rebuilt
+        # from the ORIGINAL photo, so the slow 0/180 check (~25 s on this
+        # CPU) and LayoutParser are only needed for the local-only result.
+        correcting = ai_correct and self.gemini is not None
+        if not correcting and self._is_upside_down(pre, boxes):
             turns = flipped_turns
             pre = ip.preprocess(image_bgr, max_side=2000, quarter_turns=turns)
             boxes = self._page_boxes(pre)
 
         # LayoutParser only supplies block-type hints, so it runs in the
         # background and is applied at the end - it never delays the text.
-        fut_hints = self._layout_executor.submit(self.layout.detect, pre.color)
+        fut_hints = None if correcting else self._layout_executor.submit(self.layout.detect, pre.color)
         blocks = build_layout(boxes, pre.horizontal_rules)
         result = PipelineResult(pre=pre, blocks=blocks, layout_engine=self.layout.engine,
                                 processing_ms=0, rotation=turns * 90)
@@ -1453,7 +1598,10 @@ class OcrPipeline:
         # bottom), right-to-left within a row.
         order = [(bi, ri, ci, cell) for bi, b in enumerate(blocks)
                  for ri, r in enumerate(b.rows) for ci, cell in enumerate(r.cells)]
-        to_arabic = []                                # mixed: boxes UTRNet read as Arabic
+        # Mixed: a box UTRNet reads as Arabic goes to EasyOCR at once, on a
+        # second thread, while UTRNet goes on with the next boxes (~10 %
+        # faster than one after the other on this dual-core CPU).
+        to_arabic = []                                # (item, future)
         for start in range(0, len(order), self.CHUNK):
             chunk = order[start:start + self.CHUNK]
             images = [self._crop(pre, item[3].box) for item in chunk]
@@ -1461,30 +1609,40 @@ class OcrPipeline:
             for item, image, res in zip(chunk, images, engine.recognize_batch(images)):
                 self._accept(item[3], res)
                 if language == "mixed" and looks_arabic(res.text):
-                    to_arabic.append((item, image))
+                    to_arabic.append((item, self._arabic_executor.submit(
+                        self.arabic.recognize_batch, [image])))
                 yield "cell", item
+        for item, future in to_arabic:
+            self._accept(item[3], future.result()[0])
+            yield "cell", item
         if to_arabic:
-            t_ar = time.perf_counter()
-            for start in range(0, len(to_arabic), self.CHUNK):
-                chunk = to_arabic[start:start + self.CHUNK]
-                for (item, _), res in zip(chunk, self.arabic.recognize_batch([im for _, im in chunk])):
-                    self._accept(item[3], res)
-                    yield "cell", item
-            logger.info("EasyOCR re-read %d Arabic boxes in %d ms", len(to_arabic),
-                        (time.perf_counter() - t_ar) * 1000)
+            logger.info("EasyOCR re-read %d Arabic boxes", len(to_arabic))
 
-        apply_layout_hints(result.blocks, fut_hints.result())
+        if fut_hints is not None:
+            apply_layout_hints(result.blocks, fut_hints.result())
         self._finalise(result)
         logger.info("rough draft: %d boxes in %d ms", len(order), (time.perf_counter() - t0) * 1000)
 
-        # Vision-LLM correction: original image + rough draft -> Markdown.
+        # Vision-LLM correction: original image + rough draft -> the corrected
+        # page with its line boxes and layout. The page shown in the app (boxes,
+        # selection, book page, PDF) is built from this one answer.
         if ai_correct and self.gemini is not None:
             yield "status", "ai_correcting"
             t_ai = time.perf_counter()
             try:
-                result.corrected_markdown = self.gemini.correct(image_bgr, result.formatted_text())
-                result.ai_correction = self.gemini.last_model
-                logger.info("Gemini (%s) corrected the draft in %d ms", result.ai_correction,
+                page = self.gemini.correct_page(image_bgr, result.formatted_text())
+                h, w = image_bgr.shape[:2]
+                blocks = blocks_from_gemini(page, w, h, language)
+                if not blocks:
+                    raise RuntimeError("the corrected page has no text")
+                gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+                identity = ip.PreprocessResult(color=image_bgr, gray=gray, binary=gray,
+                                               skew_angle=0.0, original_size=(w, h))
+                result = PipelineResult(pre=identity, blocks=blocks, layout_engine="gemini",
+                                        processing_ms=0, rotation=0,
+                                        ai_correction=self.gemini.last_model)
+                logger.info("Gemini (%s) corrected the draft: %d lines in %d ms",
+                            result.ai_correction, sum(len(b.rows) for b in blocks),
                             (time.perf_counter() - t_ai) * 1000)
             except Exception as exc:  # network, quota, bad answer: keep the draft
                 logger.warning("Gemini correction failed, returning the rough draft: %s", exc)
