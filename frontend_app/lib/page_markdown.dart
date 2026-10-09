@@ -88,7 +88,7 @@ String pageMarkdown(OcrResult result, {bool Function(double confidence)? isLow})
 String displayMarkdown(OcrResult result, {bool Function(double confidence)? isLow}) =>
     result.isCorrected ? result.markdown : pageMarkdown(result, isLow: isLow);
 
-final _mdTableRule = RegExp(r'^\|?\s*:?-{3,}');
+final _mdTableRule = RegExp(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$');
 final _mdEscape = RegExp(r'\\([\\`*_\[\]<>|~=#+\-.!()])');
 
 /// Plain text of page Markdown (for Copy and the master text): headings
@@ -142,11 +142,25 @@ class MarkdownPage extends StatelessWidget {
     final ink = paper ? Colors.black : HarfColors.ink;
     final accent = paper ? HarfColors.navy : HarfColors.brightGold;
     final base = scriptStyle(language, size: paper ? 16 : 18, color: ink);
+    TextStyle heading(double scale) => base.copyWith(
+        fontSize: (base.fontSize ?? 18) * scale, fontWeight: FontWeight.w700, color: accent);
     final sheet = MarkdownStyleSheet(
       p: base,
-      h2: base.copyWith(fontSize: (base.fontSize ?? 18) * 1.25, fontWeight: FontWeight.w700,
-          color: accent),
+      // Every heading level in the reading font (Gemini uses # .. ###),
+      // centred like headings in the book.
+      h1: heading(1.3),
+      h2: heading(1.22),
+      h3: heading(1.15),
+      h4: heading(1.1),
+      h5: heading(1.05),
+      h6: heading(1.0),
+      h1Align: WrapAlignment.center,
       h2Align: WrapAlignment.center,
+      h3Align: WrapAlignment.center,
+      h4Align: WrapAlignment.center,
+      h5Align: WrapAlignment.center,
+      h6Align: WrapAlignment.center,
+      strong: const TextStyle(fontWeight: FontWeight.w700),
       listBullet: base.copyWith(color: paper ? Colors.black : HarfColors.gold),
       tableHead: base,
       tableBody: base,
@@ -158,13 +172,13 @@ class MarkdownPage extends StatelessWidget {
       textAlign: WrapAlignment.start,
     );
     final body = MarkdownBody(
-      data: markdown,
+      data: markArabicLines(markdown),
       styleSheet: sheet,
       extensionSet: md.ExtensionSet(
         md.ExtensionSet.gitHubFlavored.blockSyntaxes,
-        [_MarkSyntax(), ...md.ExtensionSet.gitHubFlavored.inlineSyntaxes],
+        [_ArabicSyntax(), _MarkSyntax(), ...md.ExtensionSet.gitHubFlavored.inlineSyntaxes],
       ),
-      builders: {'mark': _MarkBuilder()},
+      builders: {'mark': _MarkBuilder(), 'ar': _ArabicBuilder()},
     );
     if (paper) return Directionality(textDirection: TextDirection.rtl, child: body);
     return Directionality(
@@ -178,6 +192,54 @@ class MarkdownPage extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+final _arabicOnly = RegExp(r'[\u0643\u064A\u0629\u0649\u0623\u0625]'); // ك ي ة ى أ إ
+final _harakat = RegExp(r'[\u064B-\u0652\u0670]');
+final _letters = RegExp(r'[\u0621-\u064A\u0671-\u06D3]');
+
+/// True for Arabic text (Quran verses, duas): vocalised (one haraka per 4
+/// letters or more) or with Arabic-only letters. Same rule as the server's
+/// ``looks_arabic``.
+bool looksArabic(String text) {
+  final letters = _letters.allMatches(text).length;
+  if (letters < 3) return false;
+  return _arabicOnly.allMatches(text).length / letters >= 0.08 ||
+      _harakat.allMatches(text).length / letters >= 0.25;
+}
+
+const _arOpen = '\u2045', _arClose = '\u2046'; // ⁅ ⁆ - never in book text
+
+/// Wraps the text of Arabic lines in ⁅...⁆ so they are drawn in Naskh (as
+/// Arabic is printed) while Urdu lines stay in Nastaliq. Table rows are
+/// left alone (they mix both scripts by cell).
+String markArabicLines(String markdown) => markdown.split('\n').map((line) {
+      final m = RegExp(r'^(\s*(?:#{1,6}\s+|[-*+]\s+)?)(.*?)(\s*)$').firstMatch(line)!;
+      final body = m[2]!;
+      if (body.isEmpty || body.startsWith('|') || !looksArabic(body)) return line;
+      return '${m[1]}$_arOpen${body.replaceAll(_arOpen, '').replaceAll(_arClose, '')}$_arClose${m[3]}';
+    }).join('\n');
+
+/// `⁅text⁆` -> `<ar>text</ar>`
+class _ArabicSyntax extends md.InlineSyntax {
+  _ArabicSyntax() : super('$_arOpen([^$_arClose]*)$_arClose');
+
+  @override
+  bool onMatch(md.InlineParser parser, Match match) {
+    parser.addNode(md.Element.text('ar', match[1]!));
+    return true;
+  }
+}
+
+class _ArabicBuilder extends MarkdownElementBuilder {
+  @override
+  Widget? visitElementAfterWithContext(BuildContext context, md.Element element,
+      TextStyle? preferredStyle, TextStyle? parentStyle) {
+    final style = parentStyle ?? preferredStyle ?? const TextStyle();
+    final naskh = scriptStyle('arabic', size: style.fontSize ?? 18, color: style.color)
+        .copyWith(fontWeight: style.fontWeight);
+    return Text.rich(TextSpan(text: element.textContent, style: naskh));
   }
 }
 

@@ -127,4 +127,17 @@ void main() {
     expect(blocks[3].rows.length, 2); // header rule dropped
     expect(blocks[3].rows.first.cells, ['سَمِعَ', 'اس نے سنا']);
   });
+
+  test('Arabic lines are marked for the Naskh font, Urdu lines and tables are not', () {
+    const table = '| **اوقات الصلوۃ** | **۴۵۱** |';
+    const urdu = 'ذِی الحجہ کی تیسری اور آٹھویں تاریخ کو کلمات پڑھنے ہیں۔';
+    const arabic = 'اَشْهَدُ اَنْ لَّا اِلٰهَ اِلَّا اللّٰهُ وَحْدَهٗ لَا شَرِيْكَ لَهٗ';
+    final md = [table, '| :-: | :-: |', urdu, '# $arabic'].join('\n');
+    final lines = markArabicLines(md).split('\n');
+    expect(lines[0], table); // table row untouched
+    expect(lines[2], urdu); // Urdu line untouched
+    expect(lines[3], '# ⁅$arabic⁆');
+    expect(markdownToPlain(md), isNot(contains(':-:'))); // short table rules dropped
+    expect(looksArabic('جن لوگوں نے کفر کا رویہ اختیار کیا ہے'), isFalse);
+  });
 }

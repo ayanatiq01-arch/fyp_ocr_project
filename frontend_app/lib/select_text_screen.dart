@@ -19,6 +19,7 @@ import 'package:image_picker/image_picker.dart';
 import 'api_service.dart';
 import 'app_settings.dart';
 import 'book_session.dart';
+import 'page_markdown.dart';
 import 'theme.dart';
 
 class SelectTextScreen extends StatefulWidget {
@@ -368,7 +369,14 @@ class _SelectTextScreenState extends State<SelectTextScreen> {
     );
   }
 
-  String get _selectedText => _hasSelection ? _selectionResult().currentText() : '';
+  /// Text shown under the photo: the corrected page when the whole page
+  /// is selected (that is what "Add to Book" saves), else the selected words.
+  String get _selectedText {
+    if (!_hasSelection) return '';
+    final r = _result;
+    if (_wholePage && r != null && r.isCorrected) return markdownToPlain(r.markdown);
+    return _selectionResult().currentText();
+  }
 
   bool get _wholePage => _lo == 0 && _hi == _words.length - 1;
 

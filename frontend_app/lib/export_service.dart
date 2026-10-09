@@ -71,7 +71,7 @@ class ExportBlock {
         kind = 'Title';
         row = ExportRow([markdownToPlain(t)]);
       } else if (t.startsWith('|')) {
-        if (RegExp(r'^\|?\s*:?-{3,}').hasMatch(t)) continue; // header rule
+        if (RegExp(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$').hasMatch(t)) continue; // header rule
         kind = 'Table';
         row = ExportRow(t
             .replaceAll(RegExp(r'^\||\|$'), '')
