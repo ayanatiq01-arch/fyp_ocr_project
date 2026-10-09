@@ -278,7 +278,13 @@ Future<Uint8List> buildImagePdf(List<List<Uint8List>> pages, {String title = 'Ha
                   style: const pw.TextStyle(fontSize: 11, color: PdfColors.grey700)),
             ),
             pw.SizedBox(height: 14),
-            pw.Image(pw.MemoryImage(slice), fit: pw.BoxFit.fitWidth, alignment: pw.Alignment.topCenter),
+            // Expanded: the slice gets exactly the space left under the page
+            // number. (A fitWidth image taller than that space was silently
+            // left out of the PDF - pages came out blank.)
+            pw.Expanded(
+              child: pw.Image(pw.MemoryImage(slice),
+                  fit: pw.BoxFit.contain, alignment: pw.Alignment.topCenter),
+            ),
           ],
         ),
       ));
@@ -419,7 +425,7 @@ class ExportService {
   /// layout as on screen); if that fails, from the text with the bundled
   /// Naskh font. Every failure is also reported to the server log.
   static Future<(String, File)> exportBook(BuildContext context, BookSession session,
-      ExportFormat format, {void Function(String where, String error)? report}) async {
+      ExportFormat format, {String? fileName, void Function(String where, String error)? report}) async {
     final pages = session.pages.map(ExportPage.of).toList();
     final Uint8List bytes;
     final String extension;
@@ -446,11 +452,9 @@ class ExportService {
         extension = 'docx';
     }
     final dir = await getApplicationDocumentsDirectory();
-    final stamp = DateTime.now().toIso8601String().substring(0, 19).replaceAll(RegExp(r'[:T]'), '-');
-    // ASCII file name: some apps / file managers fail on Urdu file names.
-    final ascii = session.title.replaceAll(RegExp(r'[^A-Za-z0-9 _-]'), '').trim().replaceAll(' ', '_');
-    final fileName = '${ascii.isEmpty ? 'HarfScan_Book' : ascii}_$stamp.$extension';
-    final file = File('${dir.path}/$fileName');
+    final base = safeFileName(fileName ?? defaultFileName(session));
+    final name = '${base.isEmpty ? defaultFileName(session) : base}.$extension';
+    final file = File('${dir.path}/$name');
     await file.writeAsBytes(bytes, flush: true);
 
     final mime = format == ExportFormat.pdf
@@ -458,13 +462,29 @@ class ExportService {
         : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     try {
       final saved = await _downloads
-          .invokeMethod<String>('save', {'path': file.path, 'name': fileName, 'mime': mime});
-      return (saved ?? fileName, file);
+          .invokeMethod<String>('save', {'path': file.path, 'name': name, 'mime': mime});
+      return (saved ?? name, file);
     } catch (e) {
       report?.call('save-downloads', '$e');
       rethrow;
     }
   }
+
+  /// The suggested file name: the book title (Latin letters / digits only,
+  /// as some apps fail on other names) and the date.
+  static String defaultFileName(BookSession session) {
+    final ascii = session.title.replaceAll(RegExp(r'[^A-Za-z0-9 _-]'), '').trim().replaceAll(' ', '_');
+    final day = DateTime.now().toIso8601String().substring(0, 10);
+    return '${ascii.isEmpty ? 'HarfScan_Book' : ascii}_$day';
+  }
+
+  /// A name the user typed, without characters a file name cannot have and
+  /// without an extension the user may have typed.
+  static String safeFileName(String name) => name
+      .trim()
+      .replaceAll(RegExp(r'\.(pdf|docx)$', caseSensitive: false), '')
+      .replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1F]'), '')
+      .trim();
 
   /// Opens the share sheet (WhatsApp, Drive, email ...) for an exported file.
   static Future<void> share(File file, String subject) =>

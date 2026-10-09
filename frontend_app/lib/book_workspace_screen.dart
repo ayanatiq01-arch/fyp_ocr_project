@@ -21,6 +21,7 @@ import 'book_session.dart';
 import 'select_text_screen.dart';
 import 'export_service.dart';
 import 'page_markdown.dart';
+import 'pdf_viewer_screen.dart';
 import 'theme.dart';
 
 class BookWorkspaceScreen extends StatefulWidget {
@@ -105,14 +106,50 @@ class _BookWorkspaceScreenState extends State<BookWorkspaceScreen> {
         source: source, session: _session, settings: widget.settings);
   }
 
+  /// Asks for the file name (the book title and date are suggested).
+  Future<String?> _askFileName(ExportFormat format) async {
+    final ext = format == ExportFormat.pdf ? '.pdf' : '.docx';
+    final controller = TextEditingController(text: ExportService.defaultFileName(_session));
+    controller.selection = TextSelection(baseOffset: 0, extentOffset: controller.text.length);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: HarfColors.slate,
+        title: Text(format == ExportFormat.pdf ? 'Save PDF' : 'Save Word file'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: InputDecoration(labelText: 'File name', suffixText: ext),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text('Save')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (name == null) return null;
+    final safe = ExportService.safeFileName(name);
+    return safe.isEmpty ? ExportService.defaultFileName(_session) : safe;
+  }
+
   Future<void> _export(ExportFormat format) async {
     if (_session.isEmpty) return;
+    final fileName = await _askFileName(format);
+    if (fileName == null || !mounted) return;
     setState(() => _exporting = true);
     final api = widget.settings.api;
     try {
       final (saved, file) = await ExportService.exportBook(context, _session, format,
-          report: (where, error) => api.reportError(where, error));
+          fileName: fileName, report: (where, error) => api.reportError(where, error));
       if (!mounted) return;
+      if (format == ExportFormat.pdf) {
+        // Open the PDF in the app; it is shared from there.
+        Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => PdfViewerScreen(file: file, savedTo: saved)));
+        return;
+      }
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(seconds: 8),
         content: Text('Saved to $saved'),

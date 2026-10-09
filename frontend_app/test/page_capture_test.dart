@@ -43,6 +43,9 @@ void main() {
     await tester.runAsync(() async {
       final pdf = await buildImagePdf(images!);
       expect(String.fromCharCodes(pdf.take(5)), '%PDF-');
+      // every A4 slice is embedded as an image (a PDF with only page numbers was the bug)
+      final text = String.fromCharCodes(pdf);
+      expect(RegExp('/SMask ').allMatches(text).length, images!.single.length); // one per slice image
     });
   });
 }
